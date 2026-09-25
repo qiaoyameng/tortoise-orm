@@ -15,6 +15,7 @@ Added
 ^^^^^
 - ``Q.__bool__()`` so ``Q`` objects with no filters/children (including nested empty ``Q`` children) are falsy. (#2227)
 - PostgreSQL ``password`` credential now accepts a sync or async callable, resolved once per new connection, to support short-lived credentials such as AWS RDS/Aurora IAM tokens and Azure Entra ID tokens. (#2261)
+- ``ManyToManyRelation.add()`` now accepts ``through_defaults`` to set extra fields of an explicitly configured through model when adding relations, either as one dict applied to all added instances or as a sequence of dicts matched positionally. All keys and values are validated before anything is written, existing relations are left untouched, and callable values are evaluated once per relation actually inserted.
 
 Changed
 ^^^^^^^

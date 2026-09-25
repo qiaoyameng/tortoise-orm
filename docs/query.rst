@@ -210,6 +210,36 @@ You can use them like this:
 
     await event.participants.add(participant_1, participant_2)
 
+If the relation uses an explicitly configured through model — a regular model
+whose table is the relation's ``through`` table — extra fields of that model
+(such as ``role`` or ``joined_at``) can be set while adding relations with
+``through_defaults``. Pass a single dict to apply the same values to every
+added instance, or a sequence of dicts (use ``None`` for no extra values)
+matched positionally with the added instances:
+
+.. code-block:: python3
+
+    class Membership(Model):
+        event = fields.ForeignKeyField("models.Event", related_name="memberships")
+        team = fields.ForeignKeyField("models.Team", related_name="memberships")
+        role = fields.CharField(max_length=50, null=True)
+
+        class Meta:
+            table = "event_team"
+            unique_together = (("event", "team"),)
+
+    await event.participants.add(team, through_defaults={"role": "captain"})
+    await event.participants.add(
+        team_1, team_2, through_defaults=[{"role": "captain"}, {"role": "member"}]
+    )
+
+All keys and values are validated against the through model before anything is
+written, so an invalid value aborts the whole call without persisting any of
+the new relations. Relations that already exist are silently ignored as before
+— their through values are never updated. Callable values are evaluated once
+per relation that is actually inserted; existing relations are skipped without
+evaluating them.
+
 
 .. _filtering-queries:
 

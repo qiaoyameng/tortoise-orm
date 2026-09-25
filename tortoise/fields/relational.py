@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import AsyncGenerator, Generator, Iterator
+from collections.abc import AsyncGenerator, Generator, Iterable, Iterator
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, overload
 
 from pypika_tortoise.queries import Table
@@ -174,18 +174,156 @@ class ManyToManyRelation(ReverseRelation[MODEL]):
         self.field = m2m_field
         self.instance = instance
 
-    async def add(self, *instances: MODEL, using_db: BaseDBAsyncClient | None = None) -> None:
+    def _get_through_model(self) -> type[Model] | None:
+        """
+        Returns the registered model whose table matches the through table of this
+        relation, or ``None`` if no such model exists.
+        """
+        from tortoise import Tortoise
+        from tortoise.context import get_current_context
+
+        ctx = get_current_context()
+        if ctx is not None and ctx._inited and ctx.apps is not None:
+            apps = ctx.apps
+        else:
+            apps = Tortoise.apps
+        if not apps:
+            return None
+        for model in apps.get_models_iterable():
+            if (
+                model._meta.db_table == self.field.through
+                and model._meta.schema == self.field.through_schema
+            ):
+                return model
+        return None
+
+    def _normalize_through_defaults(
+        self,
+        through_defaults: dict[str, Any] | Iterable[dict[str, Any] | None],
+        count: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Normalizes ``through_defaults`` to a list of dicts, one per instance to add.
+
+        A single dict is broadcast to all instances; a sequence of dicts (or ``None``
+        entries) is matched positionally with the instances.
+        """
+        if isinstance(through_defaults, dict):
+            return [dict(through_defaults) for _ in range(count)]
+        defaults_list = list(through_defaults)
+        if len(defaults_list) != count:
+            raise ConfigurationError(
+                f"through_defaults has {len(defaults_list)} entries, "
+                f"but {count} instance(s) were passed to add()"
+            )
+        normalized: list[dict[str, Any]] = []
+        for defaults in defaults_list:
+            if defaults is None:
+                normalized.append({})
+            elif isinstance(defaults, dict):
+                normalized.append(dict(defaults))
+            else:
+                raise ConfigurationError(
+                    "through_defaults entries must be dicts or None, "
+                    f"got {type(defaults).__name__}"
+                )
+        return normalized
+
+    def _resolve_through_defaults_fields(
+        self, through_model: type[Model], defaults_list: list[dict[str, Any]]
+    ) -> tuple[list[str], list[str], list[Field]]:
+        """
+        Validates the keys of ``through_defaults`` against the through model and
+        returns the keys, DB columns and fields to write, in a stable order.
+
+        Empty dicts (and ``None`` entries) mean "no extra values for this
+        instance"; their missing keys are written as NULL. All non-empty dicts
+        must provide the same set of fields.
+        """
+        keys: tuple[str, ...] | None = None
+        keys_list: list[str] = []
+        for defaults in defaults_list:
+            if not defaults:
+                continue
+            if keys is None:
+                keys = tuple(defaults.keys())
+            elif set(defaults.keys()) != set(keys):
+                raise ConfigurationError(
+                    "All non-empty through_defaults dicts of one add() call "
+                    "must provide the same set of fields"
+                )
+        columns: list[str] = []
+        fields: list[Field] = []
+        for key in keys or ():
+            field = through_model._meta.fields_map.get(key)
+            column = through_model._meta.fields_db_projection.get(key)
+            if field is None or column is None:
+                raise ConfigurationError(
+                    f'"{key}" is not a concrete field of through model '
+                    f'"{through_model.__name__}"'
+                )
+            if column in (self.field.backward_key, self.field.forward_key):
+                raise ConfigurationError(
+                    f'Cannot set relation key "{key}" via through_defaults, '
+                    "it is managed by the many-to-many relation itself"
+                )
+            keys_list.append(key)
+            columns.append(column)
+            fields.append(field)
+        return keys_list, columns, fields
+
+    async def add(
+        self,
+        *instances: MODEL,
+        using_db: BaseDBAsyncClient | None = None,
+        through_defaults: dict[str, Any] | Iterable[dict[str, Any] | None] | None = None,
+    ) -> None:
         """
         Adds one or more of ``instances`` to the relation.
 
         If it is already added, it will be silently ignored.
 
+        Extra values for an explicitly configured through model (a registered model
+        whose table is the relation's through table) can be supplied via
+        ``through_defaults``: either a single dict applied to every added instance,
+        or a sequence of dicts (``None`` for no extra values) matched positionally
+        with ``instances``. All keys and values are validated before anything is
+        written, so an invalid value aborts the whole call without persisting any
+        of the new relations. Relations that already exist are left untouched
+        (their through values are never updated). Callable values are evaluated
+        once per relation that is actually inserted; existing relations are skipped
+        without evaluating them.
+
+        :param using_db: Specific DB connection to use instead of default bound.
+        :param through_defaults: Extra values for the through model, either one dict
+            for all instances or one dict per instance.
         :raises OperationalError: If Object to add is not saved.
+        :raises ConfigurationError: If ``through_defaults`` is malformed, refers to
+            unknown fields, or no through model is registered for the through table.
+        :raises ValidationError: If a ``through_defaults`` value is invalid for its
+            through model field.
         """
         if not instances:
             return
         if not self.instance._saved_in_db:
             raise OperationalError(f"You should first call .save() on {self.instance}")
+        through_model: type[Model] | None = None
+        extra_keys: list[str] = []
+        extra_columns: list[str] = []
+        extra_fields: list[Field] = []
+        if through_defaults is None:
+            defaults_list: list[dict[str, Any]] | None = None
+        else:
+            defaults_list = self._normalize_through_defaults(through_defaults, len(instances))
+            through_model = self._get_through_model()
+            if through_model is None:
+                raise ConfigurationError(
+                    "through_defaults requires a model registered for the through "
+                    f'table "{self.field.through}"'
+                )
+            extra_keys, extra_columns, extra_fields = self._resolve_through_defaults_fields(
+                through_model, defaults_list
+            )
         db = using_db or self.remote_model._meta.db
         pk_formatting_func = type(self.instance)._meta.pk.to_db_value
         related_pk_formatting_func = type(instances[0])._meta.pk.to_db_value
@@ -214,9 +352,24 @@ class ManyToManyRelation(ReverseRelation[MODEL]):
         }
 
         if pks_f_to_insert := set(pks_f) - already_existing_forward_pks:
-            query = db.query_class.into(through_table).columns(forward_field, backward_field)
+            extra_column_fields = [through_table[column] for column in extra_columns]
+            query = db.query_class.into(through_table).columns(
+                forward_field, backward_field, *extra_column_fields
+            )
+            defaults_by_pk: dict = {}
+            if defaults_list is not None:
+                for pk_f, defaults in zip(pks_f, defaults_list):
+                    defaults_by_pk.setdefault(pk_f, defaults)
             for pk_f in pks_f_to_insert:
-                query = query.insert(pk_f, pk_b)
+                row: list = [pk_f, pk_b]
+                if defaults_list is not None and through_model is not None:
+                    defaults = defaults_by_pk[pk_f]
+                    for key, field in zip(extra_keys, extra_fields):
+                        value = defaults.get(key)
+                        if callable(value):
+                            value = value()
+                        row.append(field.to_db_value(value, through_model))
+                query = query.insert(*row)
             await db.execute_query(*query.get_parameterized_sql())
 
     async def clear(self, using_db: BaseDBAsyncClient | None = None) -> None:
