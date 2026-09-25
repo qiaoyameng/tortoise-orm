@@ -1,6 +1,24 @@
 from pypika_tortoise import SqlContext, functions
 
-from tortoise.expressions import Aggregate, Function
+from tortoise.expressions import Aggregate, Function, RowNumber, Rows
+
+__all__ = (
+    "Trim",
+    "Length",
+    "Coalesce",
+    "Lower",
+    "Upper",
+    "Concat",
+    "Count",
+    "Sum",
+    "Max",
+    "Min",
+    "Avg",
+    "RowNumber",
+    "Rows",
+    "Function",
+    "Aggregate",
+)
 
 ##############################################################################
 # Standard functions

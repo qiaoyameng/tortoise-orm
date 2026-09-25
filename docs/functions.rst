@@ -54,6 +54,50 @@ So often makes sense with a ``.first()`` QuerySet.
 .. autoclass:: tortoise.functions.Avg
 
 
+Window functions
+=================
+
+Window (analytic) functions compute a value over a partition of the result set,
+e.g. a ``ROW_NUMBER()`` per group for leaderboard-style queries.
+
+Use :class:`tortoise.expressions.RowNumber` or wrap an existing aggregate with
+``.over()``:
+
+.. code-block:: py3
+
+    from tortoise.expressions import RowNumber, Rows
+    from tortoise.functions import Sum
+
+    # top 3 players per category
+    await (
+        Score.annotate(rn=RowNumber(partition_by="category", order_by="-points"))
+        .filter(rn__lte=3)
+        .order_by("category", "rn")
+    )
+
+    # running total per category
+    await Score.annotate(
+        running=Sum("points").over(
+            partition_by="category", order_by="id", rows=Rows(None, 0)
+        )
+    )
+
+Window functions are evaluated after the ``WHERE`` clause, so filtering on a
+window annotation (e.g. ``.filter(rn__lte=3)``) automatically wraps the query
+in a subquery and applies that filter, together with ordering and pagination,
+in the outer query. Other filters stay in the inner query.
+
+``Rows(start, end)`` describes a ``ROWS`` frame as offsets from the current row:
+``None`` means unbounded, ``0`` the current row, negative values ``n PRECEDING``
+and positive values ``n FOLLOWING``. Unsupported frame combinations and
+combinations not supported by the database (e.g. ``DISTINCT`` window aggregates)
+raise ``OperationalError`` before the query is executed.
+
+.. autoclass:: tortoise.expressions.RowNumber
+
+.. autoclass:: tortoise.expressions.Rows
+
+
 Base function class
 ===================
 

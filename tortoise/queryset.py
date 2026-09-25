@@ -114,6 +114,7 @@ class AwaitableQuery(_ChooseDBMixin[MODEL], Generic[MODEL]):
         "_annotations",
         "_custom_filters",
         "_q_objects",
+        "_window_outer_table",
     )
 
     def __init__(self, model: type[MODEL]) -> None:
@@ -125,6 +126,7 @@ class AwaitableQuery(_ChooseDBMixin[MODEL], Generic[MODEL]):
         self._annotations: dict[str, Expression | Term] = {}
         self._custom_filters: dict[str, FilterInfoDict] = {}
         self._q_objects: list[Q] = []
+        self._window_outer_table: Table | None = None
 
     @property
     def capabilities(self) -> Capabilities:
@@ -139,9 +141,10 @@ class AwaitableQuery(_ChooseDBMixin[MODEL], Generic[MODEL]):
     def resolve_filters(self, fields_for_select: Collection[str] | None = None) -> None:
         """Builds the common filters for a QuerySet."""
         has_aggregate = self._resolve_annotate(fields_for_select)
+        regular_q_objects, window_q_objects = self._split_window_q_objects()
 
         modifier = QueryModifier()
-        for node in self._q_objects:
+        for node in regular_q_objects:
             modifier &= node.resolve(
                 ResolveContext(
                     model=self.model,
@@ -163,6 +166,166 @@ class AwaitableQuery(_ChooseDBMixin[MODEL], Generic[MODEL]):
             self.query = self.query.groupby(
                 *[self.model._meta.basetable[field] for field in self.model._meta.db_fields]
             )
+
+        if window_q_objects:
+            self._apply_window_filters(window_q_objects)
+
+    def _window_annotation_names(self) -> set[str]:
+        """Names of annotations that are window functions."""
+        return {
+            key
+            for key, annotation in self._annotations.items()
+            if getattr(annotation, "is_window_function", False)
+        }
+
+    def _split_window_q_objects(self) -> tuple[list[Q], list[Q]]:
+        """
+        Split the Q objects into ``(regular, window)`` filters.
+
+        Window functions are evaluated after the ``WHERE`` clause, so filters
+        referencing window function annotations must be applied in an outer
+        query. Simple ``AND`` Q objects are split per kwarg so that regular
+        filters stay in the inner query; anything more complex (``OR``,
+        negation, nested Q objects) is moved to the outer query as a whole.
+        """
+        window_names = self._window_annotation_names()
+        if not window_names:
+            return list(self._q_objects), []
+
+        def references_window(q_object: Q) -> bool:
+            return any(
+                key.split("__")[0] in window_names for key in q_object.filters
+            ) or any(references_window(child) for child in q_object.children)
+
+        regular_q_objects: list[Q] = []
+        window_q_objects: list[Q] = []
+        for q_object in self._q_objects:
+            if not references_window(q_object):
+                regular_q_objects.append(q_object)
+            elif q_object.join_type == Q.AND and not q_object.children and not q_object._is_negated:
+                regular_kwargs = {}
+                window_kwargs = {}
+                for key, value in q_object.filters.items():
+                    if key.split("__")[0] in window_names:
+                        window_kwargs[key] = value
+                    else:
+                        regular_kwargs[key] = value
+                if regular_kwargs:
+                    regular_q_objects.append(Q(**regular_kwargs))
+                window_q_objects.append(Q(**window_kwargs))
+            else:
+                window_q_objects.append(q_object)
+        return regular_q_objects, window_q_objects
+
+    def _has_window_filters(self) -> bool:
+        return bool(self._q_objects) and bool(self._split_window_q_objects()[1])
+
+    def _window_filtered_annotation_names(self) -> set[str]:
+        """Window annotation names that are referenced by filters."""
+        window_names = self._window_annotation_names()
+        filtered: set[str] = set()
+
+        def collect(q_object: Q) -> None:
+            for key in q_object.filters:
+                base_name = key.split("__")[0]
+                if base_name in window_names:
+                    filtered.add(base_name)
+            for child in q_object.children:
+                collect(child)
+
+        for q_object in self._q_objects:
+            collect(q_object)
+        return filtered
+
+    def _window_outer_required_columns(self, window_q_objects: list[Q]) -> list[str]:
+        """DB column names the outer query references besides the annotations."""
+        meta = self.model._meta
+        required: list[str] = []
+        for ordering in getattr(self, "_orderings", ()):
+            field_name = ordering[0]
+            if "__" in field_name or field_name in self._annotations:
+                continue
+            field_object = meta.fields_map.get(field_name)
+            if field_object is not None:
+                required.append(field_object.source_field or field_name)
+        for q_object in window_q_objects:
+            for key in self._window_outer_filter_keys(q_object):
+                base_name = key.split("__")[0]
+                if (
+                    base_name in self._annotations
+                    or base_name in meta.fetch_fields
+                    or key in self._custom_filters
+                ):
+                    continue
+                try:
+                    filter_info = meta.get_filter(key)
+                except KeyError:
+                    # invalid filters are reported when the Q object is resolved
+                    continue
+                if "table" not in filter_info:
+                    required.append(filter_info.get("source_field", filter_info["field"]))
+        return required
+
+    def _window_outer_filter_keys(self, q_object: Q) -> list[str]:
+        keys = list(q_object.filters)
+        for child in q_object.children:
+            keys.extend(self._window_outer_filter_keys(child))
+        return keys
+
+    def _ensure_window_inner_selects(self, inner_query: QueryBuilder, columns: list[str]) -> None:
+        """Make sure the inner query selects every column the outer query references."""
+        existing: set[str] = set()
+        for select in inner_query._selects:
+            alias = getattr(select, "alias", None)
+            if alias:
+                existing.add(alias)
+            name = getattr(select, "name", None)
+            if name:
+                existing.add(name)
+        table = self.model._meta.basetable
+        for column in dict.fromkeys(columns):
+            if column not in existing:
+                inner_query._select_field(table[column].as_(column))
+
+    def _refine_window_inner_query(self, inner_query: QueryBuilder) -> None:
+        """Hook to adjust the inner (window) query before it is wrapped."""
+
+    def _refine_window_outer_query(self, outer_table: Table) -> None:
+        """Hook to adjust the outer query after wrapping the window subquery."""
+
+    def _apply_window_filters(self, window_q_objects: list[Q]) -> None:
+        """
+        Wrap the current query in an outer query and apply the filters that
+        reference window function annotations on it.
+        """
+        inner_query = self.query
+        self._refine_window_inner_query(inner_query)
+        self._ensure_window_inner_selects(
+            inner_query, self._window_outer_required_columns(window_q_objects)
+        )
+        alias = "_window"
+        outer_table = Table(alias)
+        self.query = self.model._meta.db.query_class.from_(inner_query.as_(alias)).select("*")
+        self._joined_tables = []
+        self._window_outer_table = outer_table
+
+        modifier = QueryModifier()
+        for node in window_q_objects:
+            modifier &= node.resolve(
+                ResolveContext(
+                    model=self.model,
+                    table=outer_table,
+                    annotations=self._annotations,
+                    custom_filters=self._custom_filters,
+                    for_window_filter=True,
+                )
+            )
+        for join in modifier.joins:
+            if join[0] not in self._joined_tables:
+                self.query = self.query.join(join[0], how=JoinType.left_outer).on(join[1])
+                self._joined_tables.append(join[0])
+        self.query._wheres = modifier.where_criterion
+        self._refine_window_outer_query(outer_table)
 
     def _pk_in_subquery(self, table: Table) -> Term:
         """Build ``pk IN (SELECT "_t".pk FROM (SELECT pk ...) AS "_t")`` from the current
@@ -417,6 +580,7 @@ class QuerySet(AwaitableQuery[MODEL]):
         queryset._filter_kwargs = copy(self._filter_kwargs)
         queryset._orderings = copy(self._orderings)
         queryset._joined_tables = copy(self._joined_tables)
+        queryset._window_outer_table = None
         queryset._q_objects = copy(self._q_objects)
         queryset._distinct = self._distinct
         queryset._annotations = copy(self._annotations)
@@ -1269,7 +1433,9 @@ class QuerySet(AwaitableQuery[MODEL]):
         # clean tmp records first
         self._select_related_idx = []
         self._joined_tables = []
+        self._window_outer_table = None
         table = self.model._meta.basetable
+        window_filtering = self._has_window_filters()
         if self._fields_for_select:
             # select .only() fields
             self.query = self.model._meta.basequery.select()
@@ -1285,14 +1451,30 @@ class QuerySet(AwaitableQuery[MODEL]):
                 (None,),
             )
             self._select_related_idx.append(append_item)
-        self.resolve_ordering(
-            self.model,
-            self.model._meta.basetable,
-            self._orderings,
-            self._annotations,
-            self._fields_for_select,
-        )
-        self.resolve_filters()
+        if window_filtering:
+            if self._select_related:
+                raise OperationalError(
+                    "select_related() is not supported together with "
+                    "filters on window function annotations"
+                )
+            # window filters wrap the query in a subquery; ordering and
+            # pagination must be applied on the outer query to keep their meaning
+            self.resolve_filters()
+            self.resolve_ordering(
+                self.model,
+                cast(Table, self._window_outer_table),
+                self._orderings,
+                self._annotations,
+            )
+        else:
+            self.resolve_ordering(
+                self.model,
+                self.model._meta.basetable,
+                self._orderings,
+                self._annotations,
+                self._fields_for_select,
+            )
+            self.resolve_filters()
         if self._limit is not None:
             self.query._limit = self.query._wrapper_cls(self._limit)
         if self._offset is not None:
@@ -1381,6 +1563,10 @@ class UpdateQuery(AwaitableQuery):
         # Resolve filters on a SELECT-shaped query first: filters on related fields add
         # JOINs, which are not valid in UPDATE statements on most backends, so the target
         # rows are selected by primary key through a subquery instead (see _pk_in_subquery).
+        if self._has_window_filters():
+            raise OperationalError(
+                "update() is not supported together with filters on window function annotations"
+            )
         self.query = copy(self.model._meta.basequery)
         if self.capabilities.support_update_limit_order_by and self._limit:
             self.query._limit = self.query._wrapper_cls(self._limit)
@@ -1469,6 +1655,10 @@ class DeleteQuery(AwaitableQuery):
 
     def _make_query(self) -> None:
         table = self.model._meta.basetable
+        if self._has_window_filters():
+            raise OperationalError(
+                "delete() is not supported together with filters on window function annotations"
+            )
         self.query = copy(self.model._meta.basequery)
         if self.capabilities.support_update_limit_order_by and self._limit:
             self.query._limit = self.query._wrapper_cls(self._limit)
@@ -1819,14 +2009,25 @@ class ValuesListQuery(FieldSelectQuery, Generic[SINGLE]):
         for positional_number, field in self.fields.items():
             self.add_field_to_select_query(field, positional_number)
 
-        self.resolve_ordering(
-            model=self.model,
-            table=self.model._meta.basetable,
-            orderings=self._orderings,
-            annotations=self._annotations,
-            fields_for_select=self._fields_for_select_list,
-        )
-        self.resolve_filters(self._fields_to_select_sql)
+        if self._has_window_filters():
+            fields_to_select = self._fields_to_select_sql | self._window_filtered_annotation_names()
+            self.resolve_filters(fields_to_select)
+            self.resolve_ordering(
+                model=self.model,
+                table=cast(Table, self._window_outer_table),
+                orderings=self._orderings,
+                annotations=self._annotations,
+                fields_for_select=fields_to_select,
+            )
+        else:
+            self.resolve_ordering(
+                model=self.model,
+                table=self.model._meta.basetable,
+                orderings=self._orderings,
+                annotations=self._annotations,
+                fields_for_select=self._fields_for_select_list,
+            )
+            self.resolve_filters(self._fields_to_select_sql)
         if self._limit:
             self.query._limit = self.query._wrapper_cls(self._limit)
         if self._offset:
@@ -1934,6 +2135,19 @@ class ValuesQuery(FieldSelectQuery, Generic[SINGLE]):
         self._force_indexes = force_indexes
         self._use_indexes = use_indexes
 
+    def _refine_window_inner_query(self, inner_query: QueryBuilder) -> None:
+        # keep the requested fields and the window annotations referenced by
+        # filters in the subquery; anything else is not needed
+        keep = set(self._fields_for_select) | self._window_filtered_annotation_names()
+        inner_query._selects = [select for select in inner_query._selects if select.alias in keep]
+
+    def _refine_window_outer_query(self, outer_table: Table) -> None:
+        # the outer query must only return the requested fields, even if the
+        # subquery computes extra window annotations used for filtering
+        self.query._selects = [
+            outer_table[return_as].as_(return_as) for return_as in self._fields_for_select
+        ]
+
     def _make_query(self) -> None:
         self._joined_tables = []
 
@@ -1941,14 +2155,25 @@ class ValuesQuery(FieldSelectQuery, Generic[SINGLE]):
         for return_as, field in self._fields_for_select.items():
             self.add_field_to_select_query(field, return_as)
 
-        self.resolve_ordering(
-            model=self.model,
-            table=self.model._meta.basetable,
-            orderings=self._orderings,
-            annotations=self._annotations,
-            fields_for_select=self._fields_for_select.keys(),
-        )
-        self.resolve_filters()
+        if self._has_window_filters():
+            self.resolve_filters()
+            self.resolve_ordering(
+                model=self.model,
+                table=cast(Table, self._window_outer_table),
+                orderings=self._orderings,
+                annotations=self._annotations,
+                fields_for_select=set(self._fields_for_select)
+                | self._window_filtered_annotation_names(),
+            )
+        else:
+            self.resolve_ordering(
+                model=self.model,
+                table=self.model._meta.basetable,
+                orderings=self._orderings,
+                annotations=self._annotations,
+                fields_for_select=self._fields_for_select.keys(),
+            )
+            self.resolve_filters()
 
         # remove annotations that are not in fields_for_select
         self.query._selects = [
@@ -2072,6 +2297,11 @@ class BulkUpdateQuery(UpdateQuery, Generic[MODEL]):
 
     def _make_queries(self) -> list[tuple[str, list[Any]]]:
         table = self.model._meta.basetable
+        if self._has_window_filters():
+            raise OperationalError(
+                "bulk_update() is not supported together with "
+                "filters on window function annotations"
+            )
         self.query = self._db.query_class.update(table)
         if self.capabilities.support_update_limit_order_by and self._limit:
             self.query._limit = self.query._wrapper_cls(self._limit)

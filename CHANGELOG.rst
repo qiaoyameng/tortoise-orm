@@ -13,6 +13,7 @@ Changelog
 
 Added
 ^^^^^
+- Window function support: ``RowNumber`` and ``.over()`` on existing aggregates (``Count``, ``Sum``, ``Avg``, ``Min``, ``Max``) with ``PARTITION BY``, ``ORDER BY`` and ``ROWS`` frames (``tortoise.expressions.Rows``). Filtering on a window annotation wraps the query in a subquery and applies the filter, ordering and pagination in the outer query.
 - ``Q.__bool__()`` so ``Q`` objects with no filters/children (including nested empty ``Q`` children) are falsy. (#2227)
 - PostgreSQL ``password`` credential now accepts a sync or async callable, resolved once per new connection, to support short-lived credentials such as AWS RDS/Aurora IAM tokens and Azure Entra ID tokens. (#2261)
 

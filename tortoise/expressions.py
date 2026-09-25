@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import operator
+from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from enum import Enum
@@ -8,13 +9,16 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pypika_tortoise import Case as PypikaCase
 from pypika_tortoise import Field as PypikaField
-from pypika_tortoise import SqlContext, Table
+from pypika_tortoise import Order, SqlContext, Table
+from pypika_tortoise import analytics as pypika_analytics
 from pypika_tortoise.functions import AggregateFunction, DistinctOptionFunction
 from pypika_tortoise.terms import (
+    AnalyticFunction,
     ArithmeticExpression,
     Criterion,
     Term,
     ValueWrapper,
+    WindowFrameAnalyticFunction,
 )
 from pypika_tortoise.terms import Function as PypikaFunction
 from pypika_tortoise.utils import format_alias_sql
@@ -45,6 +49,9 @@ class ResolveContext:
     table: Table
     annotations: dict[str, Any]
     custom_filters: dict[str, FilterInfoDict]
+    #: Set when resolving filters that are applied in an outer query wrapping
+    #: a subquery with window function annotations.
+    for_window_filter: bool = False
 
 
 @dataclass
@@ -352,6 +359,7 @@ class Q:
                 table=required_joins[-1][0],
                 annotations=resolve_context.annotations,
                 custom_filters=resolve_context.custom_filters,
+                for_window_filter=resolve_context.for_window_filter,
             )
         )
         return QueryModifier(joins=required_joins) & modifier
@@ -361,10 +369,6 @@ class Q:
     ) -> QueryModifier:
         having_info = resolve_context.custom_filters[key]
         annotation = resolve_context.annotations[having_info["field"]]
-        if isinstance(annotation, Term):
-            annotation_info = ResolveResult(term=annotation)
-        else:
-            annotation_info = annotation.resolve(resolve_context)
 
         operator = having_info["operator"]
         overridden_operator = (
@@ -374,6 +378,24 @@ class Q:
         )
         if overridden_operator:
             operator = overridden_operator
+
+        if getattr(annotation, "is_window_function", False):
+            # Window functions are evaluated after WHERE, so filtering on them is
+            # only possible in an outer query that wraps the window subquery.
+            if not resolve_context.for_window_filter:
+                raise OperationalError(
+                    f"Cannot filter on window function annotation "
+                    f"'{having_info['field']}' in this context"
+                )
+            return QueryModifier(
+                where_criterion=operator(PypikaField(having_info["field"]), value)
+            )
+
+        if isinstance(annotation, Term):
+            annotation_info = ResolveResult(term=annotation)
+        else:
+            annotation_info = annotation.resolve(resolve_context)
+
         if annotation_info.term.is_aggregate:
             modifier = QueryModifier(having_criterion=operator(annotation_info.term, value))
         else:
@@ -516,6 +538,73 @@ class Q:
         return self._resolve_children(resolve_context)
 
 
+class Rows:
+    """
+    ``ROWS`` frame specification for window functions.
+
+    Both bounds are expressed as offsets relative to the current row:
+
+    - ``None``: unbounded (``UNBOUNDED PRECEDING`` for ``start``,
+      ``UNBOUNDED FOLLOWING`` for ``end``)
+    - ``0``: ``CURRENT ROW``
+    - negative int ``-n``: ``n PRECEDING``
+    - positive int ``n``: ``n FOLLOWING``
+
+    :samp:`Rows(-1, 0)` renders as ``ROWS BETWEEN 1 PRECEDING AND CURRENT ROW``.
+
+    :param start: Frame start offset.
+    :param end: Frame end offset.
+    """
+
+    __slots__ = ("start", "end")
+
+    def __init__(self, start: int | None = None, end: int | None = None) -> None:
+        for bound in (start, end):
+            if bound is not None and not isinstance(bound, int):
+                raise OperationalError(f"ROWS frame bounds must be int or None, got {bound!r}")
+        self.start = start
+        self.end = end
+
+    @staticmethod
+    def _edge_sql(offset: int | None, is_start: bool) -> str:
+        if offset is None:
+            return "UNBOUNDED PRECEDING" if is_start else "UNBOUNDED FOLLOWING"
+        if offset == 0:
+            return "CURRENT ROW"
+        if offset < 0:
+            return f"{-offset} PRECEDING"
+        return f"{offset} FOLLOWING"
+
+    @classmethod
+    def _edge_order_key(cls, offset: int | None, is_start: bool) -> tuple[int, int]:
+        if offset is None:
+            return (0, 0) if is_start else (4, 0)
+        if offset == 0:
+            return (2, 0)
+        if offset < 0:
+            # larger n in "n PRECEDING" comes earlier
+            return (1, offset)
+        return (3, offset)
+
+    def edges(self) -> tuple[str, str]:
+        """Return the ``(start, end)`` frame boundary SQL fragments."""
+        return self._edge_sql(self.start, True), self._edge_sql(self.end, False)
+
+    def validate(self, dialect: str, has_order_by: bool) -> None:
+        """
+        Validate the frame against logical and dialect-specific restrictions.
+
+        :raises OperationalError: If the frame boundaries are not usable on the given dialect.
+        """
+        start_sql, end_sql = self.edges()
+        if self._edge_order_key(self.start, True) > self._edge_order_key(self.end, False):
+            raise OperationalError(
+                f"Invalid ROWS frame: start bound {start_sql} comes after end bound {end_sql}"
+            )
+        if dialect == "mssql" and not has_order_by:
+            raise OperationalError("ROWS frames require an ORDER BY in the OVER clause on MSSQL")
+
+
 class Function(Expression):
     """
     Function/Aggregate base.
@@ -534,7 +623,7 @@ class Function(Expression):
         Enable populate_field_object where we want to try and preserve the field type.
     """
 
-    __slots__ = ("field", "field_object", "default_values")
+    __slots__ = ("field", "field_object", "default_values", "_window_spec")
 
     database_func: type[PypikaFunction] = PypikaFunction
     # Enable populate_field_object where we want to try and preserve the field type.
@@ -546,6 +635,107 @@ class Function(Expression):
         self.field = field
         self.field_object: Field | None = None
         self.default_values = default_values
+        self._window_spec: tuple[tuple[Any, ...], tuple[str, ...], Rows | None] | None = None
+
+    @property
+    def is_window_function(self) -> bool:
+        """Whether this function is used as a window (analytic) function."""
+        return self._window_spec is not None
+
+    def over(
+        self,
+        partition_by: str | F | Sequence[str | F] | None = None,
+        order_by: str | Sequence[str] | None = None,
+        rows: Rows | None = None,
+    ) -> Function:
+        """
+        Use this function as a window (analytic) function with an ``OVER`` clause.
+
+        .. code-block:: py3
+
+            Sum("points").over(partition_by="category", order_by="-points")
+
+        :param partition_by: Field name(s) or ``F`` expressions to partition by.
+        :param order_by: Field name(s) to order by within the partition,
+            prefix with ``-`` for descending order.
+        :param rows: A :class:`Rows` frame specification.
+        """
+        if isinstance(partition_by, (str, F)):
+            partition_by = (partition_by,)
+        if isinstance(order_by, str):
+            order_by = (order_by,)
+        if rows is not None and not isinstance(rows, Rows):
+            raise OperationalError("rows must be a Rows instance")
+        self._window_spec = (tuple(partition_by or ()), tuple(order_by or ()), rows)
+        return self
+
+    def _get_analytic_func(self) -> type[AnalyticFunction]:
+        if isinstance(self.database_func, type) and issubclass(
+            self.database_func, AnalyticFunction
+        ):
+            return self.database_func
+        analytic_func = getattr(pypika_analytics, self.database_func.__name__, None)
+        if analytic_func is None or not issubclass(analytic_func, AnalyticFunction):
+            raise OperationalError(
+                f"{self.database_func.__name__} can not be used as a window function"
+            )
+        return analytic_func
+
+    def _resolve_window(self, resolve_context: ResolveContext) -> ResolveResult:
+        partition_by, order_by, rows = cast(tuple, self._window_spec)
+        dialect = resolve_context.model._meta.db.capabilities.dialect
+        analytic_func = self._get_analytic_func()
+
+        if getattr(self, "distinct", False):
+            raise OperationalError("DISTINCT is not supported for window functions")
+
+        joins: list[TableCriterionTuple] = []
+        args: list[Any] = []
+        output_field: Field | None = None
+        if self.field is not None:
+            function_arg = self._resolve_argument(
+                resolve_context, self.field, treat_str_as_field=True
+            )
+            args.append(function_arg.term)
+            joins = function_arg.joins
+            output_field = function_arg.output_field
+        resolved_defaults = [
+            self._resolve_argument(resolve_context, value, treat_str_as_field=False)
+            for value in self.default_values
+        ]
+        args.extend(value.term for value in resolved_defaults)
+        for value in resolved_defaults:
+            if value.joins:
+                joins = list(set(joins + value.joins))
+
+        term = analytic_func(*args)
+
+        partition_terms = []
+        for part in partition_by:
+            resolved = self._resolve_argument(resolve_context, part, treat_str_as_field=True)
+            partition_terms.append(resolved.term)
+            if resolved.joins:
+                joins = list(set(joins + resolved.joins))
+        term = term.over(*partition_terms)
+
+        for ordering in order_by:
+            field_name, order_type = (
+                (ordering[1:], Order.desc) if ordering.startswith("-") else (ordering, Order.asc)
+            )
+            resolved = self._resolve_argument(resolve_context, field_name, treat_str_as_field=True)
+            if resolved.joins:
+                joins = list(set(joins + resolved.joins))
+            term = term.orderby(resolved.term, order=order_type)
+
+        if rows is not None:
+            if not isinstance(term, WindowFrameAnalyticFunction):
+                raise OperationalError(
+                    f"{analytic_func.__name__} does not support window frames"
+                )
+            rows.validate(dialect, has_order_by=bool(order_by))
+            term = term.rows(*rows.edges())
+
+        return ResolveResult(term=term, joins=joins, output_field=output_field)
 
     def _get_function_field(self, field: Term | str, *default_values) -> PypikaFunction:
         return self.database_func(field, *default_values)  # type:ignore[arg-type]
@@ -578,6 +768,8 @@ class Function(Expression):
             (to allow self referential joins)
         :return: Dict with keys ``"joins"`` and ``"fields"``
         """
+        if self._window_spec is not None:
+            return self._resolve_window(resolve_context)
 
         function_arg = self._resolve_argument(resolve_context, self.field, treat_str_as_field=True)
         resolved_defaults = [
@@ -642,6 +834,32 @@ class Aggregate(Function):
             ret.term = PypikaCase().when(modifier.where_criterion, ret.term).else_(None)
 
         return ret
+
+
+class RowNumber(Function):
+    """
+    ``ROW_NUMBER()`` window function: the number of the current row within its
+    partition, counting from 1.
+
+    .. code-block:: py3
+
+        RowNumber(partition_by="category", order_by="-points")
+
+    :param partition_by: Field name(s) or ``F`` expressions to partition by.
+    :param order_by: Field name(s) to order by within the partition,
+        prefix with ``-`` for descending order.
+    """
+
+    database_func = pypika_analytics.RowNumber
+
+    def __init__(
+        self,
+        *,
+        partition_by: str | F | Sequence[str | F] | None = None,
+        order_by: str | Sequence[str] | None = None,
+    ) -> None:
+        super().__init__(None)  # type: ignore[arg-type]
+        self.over(partition_by=partition_by, order_by=order_by)
 
 
 class _WhenThen(Term):
