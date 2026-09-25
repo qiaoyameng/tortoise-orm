@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import operator
+from collections.abc import Iterable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from enum import Enum
@@ -8,18 +10,21 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pypika_tortoise import Case as PypikaCase
 from pypika_tortoise import Field as PypikaField
-from pypika_tortoise import SqlContext, Table
+from pypika_tortoise import Order, SqlContext, Table
+from pypika_tortoise.analytics import CURRENT_ROW, Following, Preceding
 from pypika_tortoise.functions import AggregateFunction, DistinctOptionFunction
 from pypika_tortoise.terms import (
+    AnalyticFunction,
     ArithmeticExpression,
     Criterion,
     Term,
     ValueWrapper,
+    WindowFrameAnalyticFunction,
 )
 from pypika_tortoise.terms import Function as PypikaFunction
 from pypika_tortoise.utils import format_alias_sql
 
-from tortoise.exceptions import FieldError, OperationalError
+from tortoise.exceptions import FieldError, OperationalError, UnSupportedError
 from tortoise.fields.base import Field
 from tortoise.fields.data import JSONField
 from tortoise.fields.relational import RelationalField
@@ -602,6 +607,222 @@ class Function(Expression):
             self.field_object = res_output_field
 
         return res
+
+    def over(self, window: Window | None = None, **window_kwargs: Any) -> WindowFunction:
+        """
+        Turn this function/aggregate into a window function evaluated over ``window``.
+
+        :param window: A :class:`Window` instance. If not given, one is built from
+            ``window_kwargs`` (``partition_by``, ``order_by`` and ``rows``).
+
+        .. code-block:: python3
+
+            Sum("score").over(Window(partition_by="group", order_by="id"))
+            Sum("score").over(partition_by="group", order_by="id")
+        """
+        return WindowFunction(self, window or Window(**window_kwargs))
+
+
+def _resolve_window_frame_edge(value: int | None, is_start: bool) -> Any:
+    if value is None:
+        return Preceding() if is_start else Following()
+    if value == 0:
+        return CURRENT_ROW
+    if value < 0:
+        return Preceding(-value)
+    return Following(value)
+
+
+class Window:
+    """
+    Window specification for window functions: optional ``PARTITION BY``, ``ORDER BY``
+    and a ``ROWS`` frame.
+
+    :param partition_by: Field name(s) (or ``F``/``Expression``) to partition by.
+    :param order_by: Field name(s) to order the window by. Prefix with ``-`` for
+        descending order, e.g. ``"-score"``.
+    :param rows: Optional ``(start, end)`` tuple describing a ``ROWS BETWEEN <start>
+        AND <end>`` frame. Each bound is ``None`` for ``UNBOUNDED PRECEDING``/``UNBOUNDED
+        FOLLOWING``, ``0`` for ``CURRENT ROW``, a negative int ``-n`` for ``n PRECEDING``
+        or a positive int ``n`` for ``n FOLLOWING``.
+
+    .. code-block:: python3
+
+        Window(partition_by="group", order_by="-score")
+        Window(order_by="id", rows=(None, 0))  # ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    """
+
+    __slots__ = ("partition_by", "order_by", "rows")
+
+    def __init__(
+        self,
+        partition_by: str
+        | F
+        | Expression
+        | Term
+        | Iterable[str | F | Expression | Term]
+        | None = None,
+        order_by: str | F | Expression | Iterable[str | F | Expression] | None = None,
+        rows: tuple[int | None, int | None] | None = None,
+    ) -> None:
+        if partition_by is None:
+            self.partition_by: list[Any] = []
+        elif isinstance(partition_by, (str, Expression, Term)):
+            self.partition_by = [partition_by]
+        else:
+            self.partition_by = list(partition_by)
+        if order_by is None:
+            self.order_by: list[Any] = []
+        elif isinstance(order_by, (str, Expression)):
+            self.order_by = [order_by]
+        else:
+            self.order_by = list(order_by)
+        self.rows = None
+        if rows is not None:
+            self.rows = self._validate_rows(rows)
+
+    @staticmethod
+    def _validate_rows(rows: tuple[int | None, int | None]) -> tuple[int | None, int | None]:
+        try:
+            start, end = rows
+        except (TypeError, ValueError):
+            raise OperationalError(
+                "Window rows frame must be a (start, end) tuple, "
+                "e.g. rows=(None, 0) for ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
+            ) from None
+        for bound in (start, end):
+            if bound is not None and not isinstance(bound, int):
+                raise OperationalError(
+                    f"Window rows frame bounds must be int or None, got {bound!r}"
+                )
+        # Position of a bound on the frame axis: UNBOUNDED PRECEDING < n PRECEDING
+        # < CURRENT ROW < n FOLLOWING < UNBOUNDED FOLLOWING.
+        start_pos = start if start is not None else -math.inf
+        end_pos = end if end is not None else math.inf
+        if start_pos > end_pos:
+            raise OperationalError(
+                f"Unsupported window rows frame ({start}, {end}): "
+                "the start bound must not come after the end bound"
+            )
+        return (start, end)
+
+    def _resolve_part(
+        self, resolve_context: ResolveContext, part: Any
+    ) -> ResolveResult:
+        if isinstance(part, str):
+            return F(part).resolve(resolve_context)
+        if isinstance(part, Expression):
+            return part.resolve(resolve_context)
+        if isinstance(part, Term):
+            return ResolveResult(term=part)
+        raise OperationalError(f"Invalid window specification part {part!r}")
+
+    def resolve(
+        self, resolve_context: ResolveContext
+    ) -> tuple[list[Term], list[tuple[Term, Order]], list[TableCriterionTuple]]:
+        """
+        Resolve the window specification into partition terms, ordering terms and the
+        joins they require.
+        """
+        joins: list[TableCriterionTuple] = []
+        partition_terms: list[Term] = []
+        for part in self.partition_by:
+            result = self._resolve_part(resolve_context, part)
+            partition_terms.append(result.term)
+            joins.extend(result.joins)
+
+        order_terms: list[tuple[Term, Order]] = []
+        for item in self.order_by:
+            order = Order.asc
+            if isinstance(item, str) and item.startswith("-"):
+                order = Order.desc
+                item = item[1:]
+            result = self._resolve_part(resolve_context, item)
+            order_terms.append((result.term, order))
+            joins.extend(result.joins)
+        return partition_terms, order_terms, joins
+
+
+class WindowFunction(Expression):
+    """
+    A function evaluated over a :class:`Window` (SQL ``OVER (...)`` clause).
+
+    Either wraps an existing :class:`Function`/:class:`Aggregate` (e.g. ``Sum``) or is
+    subclassed for dedicated window functions such as ``RowNumber``.
+
+    :param func: The function/aggregate to wrap. Not used by subclasses that define
+        their own ``database_func``.
+    :param window: The :class:`Window` specification. Defaults to an empty ``OVER ()``.
+
+    .. attribute:: database_func
+        :annotation: pypika_tortoise.terms.AnalyticFunction | None
+
+        The pypika analytic function this represents, if it is a dedicated window
+        function. ``None`` when wrapping a regular function/aggregate.
+    """
+
+    __slots__ = ("func", "window", "field_object")
+
+    database_func: type[AnalyticFunction] | None = None
+
+    def __init__(self, func: Function | None = None, window: Window | None = None) -> None:
+        if func is None and self.database_func is None:
+            raise OperationalError(
+                "WindowFunction requires a function/aggregate to wrap, "
+                "e.g. WindowFunction(Sum('score'), Window(...)) or Sum('score').over(...)"
+            )
+        self.func = func
+        self.window = window or Window()
+        self.field_object: Field | None = None
+
+    def _resolve_function_term(
+        self, resolve_context: ResolveContext
+    ) -> tuple[AnalyticFunction, list[TableCriterionTuple], Field | None]:
+        if self.database_func is not None:
+            return self.database_func(), [], None
+
+        func = cast(Function, self.func)
+        func_result = func.resolve(resolve_context)
+        pypika_func = func_result.term
+        name = getattr(pypika_func, "name", None)
+        if name is None or isinstance(pypika_func, AnalyticFunction):
+            raise OperationalError(
+                f"{type(func).__name__} can not be used as a window function"
+            )
+        if getattr(pypika_func, "_distinct", False):
+            raise OperationalError("DISTINCT is not supported in window functions")
+        analytic = WindowFrameAnalyticFunction(name, *pypika_func.args)
+        return analytic, func_result.joins, func_result.output_field
+
+    def resolve(self, resolve_context: ResolveContext) -> ResolveResult:
+        capabilities = resolve_context.model._meta.db.capabilities
+        if not capabilities.support_window_functions:
+            raise UnSupportedError(
+                f"Window functions are not supported by dialect {capabilities.dialect!r}"
+            )
+        if self.window.rows is not None and not capabilities.support_window_frame_rows:
+            raise UnSupportedError(
+                f"ROWS window frames are not supported by dialect {capabilities.dialect!r}"
+            )
+
+        analytic, func_joins, output_field = self._resolve_function_term(resolve_context)
+        partition_terms, order_terms, window_joins = self.window.resolve(resolve_context)
+
+        analytic = analytic.over(*partition_terms)
+        for term, order in order_terms:
+            analytic = analytic.orderby(term, order=order)
+        if self.window.rows is not None:
+            start, end = self.window.rows
+            analytic = analytic.rows(
+                _resolve_window_frame_edge(start, is_start=True),
+                _resolve_window_frame_edge(end, is_start=False),
+            )
+
+        if self.func is not None and getattr(self.func, "populate_field_object", False):
+            self.field_object = getattr(self.func, "field_object", None)
+
+        joins = list(set(func_joins + window_joins))
+        return ResolveResult(term=analytic, joins=joins, output_field=output_field)
 
 
 class Aggregate(Function):

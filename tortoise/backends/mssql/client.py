@@ -30,6 +30,8 @@ class MSSQLClient(ODBCClient):
         support_update_limit_order_by=False,
         support_for_update=False,
         support_json_attributes=True,
+        support_window_functions=True,
+        support_window_frame_rows=True,
     )
 
     def __init__(

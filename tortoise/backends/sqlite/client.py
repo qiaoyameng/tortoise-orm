@@ -61,6 +61,8 @@ class SqliteClient(BaseDBAsyncClient):
         support_update_limit_order_by=False,
         can_rollback_ddl=True,
         support_returning=True,
+        support_window_functions=True,
+        support_window_frame_rows=True,
     )
 
     def __init__(self, file_path: str, **kwargs: Any) -> None:

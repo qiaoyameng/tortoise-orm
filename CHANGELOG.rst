@@ -13,6 +13,7 @@ Changelog
 
 Added
 ^^^^^
+- Window function expressions: ``Window`` (partitioning, ordering and ``ROWS`` frames), ``RowNumber`` and ``.over()`` to wrap existing aggregates as window functions. Filtering on a window annotation moves the filter to an outer query, preserving other filters, ordering and pagination; unsupported window/frame combinations raise before execution based on the new ``support_window_functions``/``support_window_frame_rows`` capabilities.
 - ``Q.__bool__()`` so ``Q`` objects with no filters/children (including nested empty ``Q`` children) are falsy. (#2227)
 - PostgreSQL ``password`` credential now accepts a sync or async callable, resolved once per new connection, to support short-lived credentials such as AWS RDS/Aurora IAM tokens and Azure Entra ID tokens. (#2261)
 

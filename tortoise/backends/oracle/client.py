@@ -38,7 +38,11 @@ class OracleClient(ODBCClient):
     query_class = OracleQuery
     schema_generator = OracleSchemaGenerator
     executor_class = OracleExecutor
-    capabilities = Capabilities(dialect="oracle")
+    capabilities = Capabilities(
+        dialect="oracle",
+        support_window_functions=True,
+        support_window_frame_rows=True,
+    )
 
     def __init__(
         self,

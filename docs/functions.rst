@@ -54,6 +54,57 @@ So often makes sense with a ``.first()`` QuerySet.
 .. autoclass:: tortoise.functions.Avg
 
 
+Window functions
+================
+
+Window functions compute a value over a window of rows related to the current row,
+using the SQL ``OVER (...)`` clause. A window is described by a
+:class:`tortoise.expressions.Window`, which supports ``PARTITION BY``, ``ORDER BY``
+and a ``ROWS`` frame:
+
+.. code-block:: py3
+
+    from tortoise.expressions import Window
+    from tortoise.functions import RowNumber, Sum
+
+    # rank scores within each category
+    await Score.annotate(
+        rank=RowNumber(partition_by="category", order_by="-score")
+    )
+
+    # running total per category
+    await Score.annotate(
+        running=Sum("score").over(
+            Window(partition_by="category", order_by="id", rows=(None, 0))
+        )
+    )
+
+Any existing aggregate (e.g. ``Sum``, ``Count``, ``Avg``, ``Min``, ``Max``) can be
+turned into a window function with ``.over(...)``.
+
+Window function results can not be filtered in the same query level, so when a
+``filter()`` references a window annotation, Tortoise moves that filter to an
+outer query automatically, keeping the other filters, ordering and pagination
+semantics:
+
+.. code-block:: py3
+
+    # top 3 scores per category
+    await Score.annotate(
+        rank=RowNumber(partition_by="category", order_by="-score")
+    ).filter(rank__lte=3)
+
+Whether window functions and ``ROWS`` frames are supported depends on the database
+(see ``support_window_functions`` and ``support_window_frame_rows`` capabilities);
+unsupported combinations raise an error before the query is executed.
+
+.. autoclass:: tortoise.functions.RowNumber
+
+.. autoclass:: tortoise.expressions.Window
+
+.. autoclass:: tortoise.expressions.WindowFunction
+
+
 Base function class
 ===================
 

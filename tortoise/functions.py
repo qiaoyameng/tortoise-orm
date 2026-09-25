@@ -1,6 +1,6 @@
-from pypika_tortoise import SqlContext, functions
+from pypika_tortoise import SqlContext, analytics, functions
 
-from tortoise.expressions import Aggregate, Function
+from tortoise.expressions import Aggregate, Function, Window, WindowFunction
 
 ##############################################################################
 # Standard functions
@@ -136,3 +136,25 @@ class Avg(Aggregate):
 
     database_func = functions.Avg
     populate_field_object = True
+
+
+##############################################################################
+# Window functions
+##############################################################################
+
+
+class RowNumber(WindowFunction):
+    """
+    Returns the number of the current row within its window partition, counting from 1.
+
+    :samp:`RowNumber(window=Window(partition_by="group", order_by="-score"))`
+
+    The window can also be given as keyword arguments:
+
+    :samp:`RowNumber(partition_by="group", order_by="-score")`
+    """
+
+    database_func = analytics.RowNumber
+
+    def __init__(self, window: Window | None = None, **window_kwargs) -> None:
+        super().__init__(window=window or Window(**window_kwargs))

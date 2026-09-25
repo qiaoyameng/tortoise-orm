@@ -266,6 +266,18 @@ class EventTwo(Model):
         return self.name
 
 
+class Score(Model):
+    """Leaderboard-style entries used by window function tests."""
+
+    id = fields.IntField(primary_key=True)
+    category = fields.CharField(max_length=255, null=True)
+    player = fields.CharField(max_length=255)
+    score = fields.IntField(null=True)
+
+    def __str__(self):
+        return f"{self.player}: {self.score}"
+
+
 class TeamTwo(Model):
     id = fields.IntField(primary_key=True)
     name = fields.TextField()

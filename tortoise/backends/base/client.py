@@ -65,6 +65,10 @@ class Capabilities:
     :param can_rollback_ddl: Whether the database supports transactional DDL.
         Used to determine if migrations can be run atomically.
     :param support_returning: Indicates that this DB supports INSERT ... RETURNING.
+    :param support_window_functions: Indicates that this DB supports window functions
+        (the ``OVER (...)`` clause).
+    :param support_window_frame_rows: Indicates that this DB supports ``ROWS`` window
+        frames (``ROWS BETWEEN ... AND ...``).
     """
 
     def __init__(
@@ -87,6 +91,8 @@ class Capabilities:
         support_json_attributes: bool = False,
         can_rollback_ddl: bool = False,
         support_returning: bool = False,
+        support_window_functions: bool = False,
+        support_window_frame_rows: bool = False,
     ) -> None:
         super().__setattr__("_mutable", True)
 
@@ -103,6 +109,8 @@ class Capabilities:
         self.support_json_attributes = support_json_attributes
         self.can_rollback_ddl = can_rollback_ddl
         self.support_returning = support_returning
+        self.support_window_functions = support_window_functions
+        self.support_window_frame_rows = support_window_frame_rows
         super().__setattr__("_mutable", False)
 
     def __setattr__(self, attr: str, value: Any) -> None:
