@@ -6,7 +6,13 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, overload
 
 from pypika_tortoise.queries import Table
 
-from tortoise.exceptions import ConfigurationError, NoValuesFetched, OperationalError
+from tortoise.exceptions import (
+    ConfigurationError,
+    FieldError,
+    NoValuesFetched,
+    OperationalError,
+    ParamsError,
+)
 from tortoise.fields.base import CASCADE, SET_NULL, Field, OnDelete
 
 if TYPE_CHECKING:  # pragma: nocoverage
@@ -28,6 +34,16 @@ class _NoneAwaitable:
 
 
 NoneAwaitable = _NoneAwaitable()
+
+
+class _DeferredThroughValue:
+    """Marker for a callable through_defaults value, evaluated once per inserted relation."""
+
+    __slots__ = ("field", "value_func")
+
+    def __init__(self, field: Field, value_func: Any) -> None:
+        self.field = field
+        self.value_func = value_func
 
 
 class ReverseRelation(Generic[MODEL]):
@@ -174,28 +190,157 @@ class ManyToManyRelation(ReverseRelation[MODEL]):
         self.field = m2m_field
         self.instance = instance
 
-    async def add(self, *instances: MODEL, using_db: BaseDBAsyncClient | None = None) -> None:
+    def _get_through_model(self) -> type[Model] | None:
+        """
+        Returns the user-defined model backing the through table of this relation,
+        or ``None`` when the through table is auto-generated (no model registered for it).
+        """
+        from tortoise.context import get_current_context
+
+        ctx = get_current_context()
+        apps = ctx.apps if ctx else None
+        if not apps:
+            return None
+        for model in apps.get_models_iterable():
+            if (
+                model._meta.db_table == self.field.through
+                and model._meta.schema == self.field.through_schema
+            ):
+                return model
+        return None
+
+    def _resolve_through_defaults(
+        self,
+        through_model: type[Model],
+        defaults_per_instance: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """
+        Validates every ``through_defaults`` key/value against the through model and
+        converts values to their DB representation.
+
+        Returns a per-instance list of ``{db_column: value}`` dicts (callables are kept
+        unevaluated) plus the ordered list of extra through columns to insert. That list
+        covers every concrete through field outside the relation keys (so model defaults
+        are applied instead of relying on DB-level defaults), except generated primary
+        keys and fields with a DB-level default that was not explicitly provided.
+
+        All field validation happens here, before anything is written to the DB.
+        """
+        backward_key, forward_key = self.field.backward_key, self.field.forward_key
+        meta = through_model._meta
+        fields_db_projection = through_model._meta.fields_db_projection
+        extra_columns: list[str] = []
+        for field_name, column in fields_db_projection.items():
+            if column in (backward_key, forward_key):
+                continue
+            field_obj = meta.fields_map[field_name]
+            if field_obj.pk and field_obj.generated:
+                continue
+            if field_obj.has_db_default():
+                # Omitted unless explicitly provided, so the DB default applies.
+                continue
+            extra_columns.append(column)
+        resolved_per_instance: list[dict[str, Any]] = []
+        for defaults in defaults_per_instance:
+            resolved: dict[str, Any] = {}
+            for field_name, value in defaults.items():
+                if field_name not in fields_db_projection:
+                    raise FieldError(
+                        f"Invalid through_defaults field '{field_name}' for through model "
+                        f"'{through_model.__name__}'"
+                    )
+                column = fields_db_projection[field_name]
+                if column in (backward_key, forward_key):
+                    raise FieldError(
+                        f"through_defaults cannot set '{field_name}': it is part of the "
+                        f"many-to-many relation itself"
+                    )
+                field_obj = through_model._meta.fields_map[field_name]
+                # Callables are evaluated lazily, exactly once per actually inserted
+                # relation; everything else is converted (and thereby validated) now.
+                if callable(value):
+                    resolved[column] = _DeferredThroughValue(field_obj, value)
+                else:
+                    resolved[column] = field_obj.to_db_value(value, through_model)
+                if column not in extra_columns:
+                    extra_columns.append(column)
+            resolved_per_instance.append(resolved)
+        return resolved_per_instance, extra_columns
+
+    async def add(
+        self,
+        *instances: MODEL | tuple[MODEL, dict[str, Any]],
+        using_db: BaseDBAsyncClient | None = None,
+        through_defaults: dict[str, Any] | None = None,
+    ) -> None:
         """
         Adds one or more of ``instances`` to the relation.
 
         If it is already added, it will be silently ignored.
 
+        Extra fields of an explicitly configured through model can be populated via
+        ``through_defaults`` and/or by passing ``(instance, defaults)`` tuples to give
+        values per object. Per-object values are merged over ``through_defaults``.
+        Callable values are evaluated exactly once per actually inserted relation
+        (never for relations that already exist). All values are validated before
+        anything is written to the database, so an invalid value aborts the whole
+        batch without inserting any relation. Already existing relations are left
+        untouched: their through-model fields are never updated.
+
+        :param instances: Related model instances, or ``(instance, defaults)`` tuples.
+        :param using_db: Specific DB connection to use instead of default bound.
+        :param through_defaults: Extra field values for the through model, applied to
+            every added instance unless overridden per object.
         :raises OperationalError: If Object to add is not saved.
+        :raises ParamsError: If arguments are malformed.
+        :raises FieldError: If a through_defaults key is not a concrete field of the
+            through model, or targets one of the relation key columns.
         """
         if not instances:
             return
         if not self.instance._saved_in_db:
             raise OperationalError(f"You should first call .save() on {self.instance}")
+        if through_defaults is not None and not isinstance(through_defaults, dict):
+            raise ParamsError("through_defaults must be a dict of field names to values")
+        shared_defaults = through_defaults or {}
+        normalized: list[tuple[MODEL, dict[str, Any]]] = []
+        for item in instances:
+            if isinstance(item, tuple):
+                if len(item) != 2 or not isinstance(item[1], dict):
+                    raise ParamsError(
+                        "add() accepts model instances or (instance, defaults) tuples"
+                    )
+                instance_to_add, per_object_defaults = item
+            else:
+                instance_to_add, per_object_defaults = item, {}
+            normalized.append((instance_to_add, {**shared_defaults, **per_object_defaults}))
         db = using_db or self.remote_model._meta.db
         pk_formatting_func = type(self.instance)._meta.pk.to_db_value
-        related_pk_formatting_func = type(instances[0])._meta.pk.to_db_value
+        related_pk_formatting_func = type(normalized[0][0])._meta.pk.to_db_value
         pk_b = pk_formatting_func(self.instance.pk, self.instance)
         pks_f: list = []
-        for instance_to_add in instances:
+        defaults_per_instance: list[dict[str, Any]] = []
+        for instance_to_add, defaults in normalized:
             if not instance_to_add._saved_in_db:
                 raise OperationalError(f"You should first call .save() on {instance_to_add}")
             pk_f = related_pk_formatting_func(instance_to_add.pk, instance_to_add)
             pks_f.append(pk_f)
+            defaults_per_instance.append(defaults)
+
+        through_model: type[Model] | None = None
+        resolved_per_instance: list[dict[str, Any]] = []
+        extra_columns: list[str] = []
+        if any(defaults_per_instance):
+            through_model = self._get_through_model()
+            if through_model is None:
+                raise OperationalError(
+                    "through_defaults requires an explicit through model for table "
+                    f"'{self.field.through}', but none is registered"
+                )
+            resolved_per_instance, extra_columns = self._resolve_through_defaults(
+                through_model, defaults_per_instance
+            )
+
         through_table = Table(self.field.through, schema=self.field.through_schema)
         backward_key, forward_key = self.field.backward_key, self.field.forward_key
         backward_field, forward_field = through_table[backward_key], through_table[forward_key]
@@ -213,10 +358,49 @@ class ManyToManyRelation(ReverseRelation[MODEL]):
             for r in already_existing_relations_raw
         }
 
-        if pks_f_to_insert := set(pks_f) - already_existing_forward_pks:
-            query = db.query_class.into(through_table).columns(forward_field, backward_field)
-            for pk_f in pks_f_to_insert:
-                query = query.insert(pk_f, pk_b)
+        rows_to_insert: list[tuple[Any, dict[str, Any]]] = []
+        seen_pks = set(already_existing_forward_pks)
+        for idx, pk_f in enumerate(pks_f):
+            if pk_f in seen_pks:
+                continue
+            seen_pks.add(pk_f)
+            resolved = resolved_per_instance[idx] if through_model is not None else {}
+            rows_to_insert.append((pk_f, resolved))
+
+        if rows_to_insert:
+            column_to_field: dict[str, Field] = {}
+            if through_model is not None:
+                meta = through_model._meta
+                column_to_field = {
+                    column: meta.fields_map[field_name]
+                    for field_name, column in meta.fields_db_projection.items()
+                }
+            extra_fields = [through_table[column] for column in extra_columns]
+            query = db.query_class.into(through_table).columns(
+                forward_field, backward_field, *extra_fields
+            )
+            for pk_f, resolved in rows_to_insert:
+                row = [pk_f, pk_b]
+                for column in extra_columns:
+                    value = resolved.get(column)
+                    if isinstance(value, _DeferredThroughValue):
+                        # A deferred callable: evaluate it now, exactly once for this
+                        # inserted relation, and validate/convert the result.
+                        value = value.field.to_db_value(value.value_func(), through_model)
+                    elif value is None and column not in resolved:
+                        # Column not provided for this instance: fall back to the
+                        # through field's default (called once per row if callable).
+                        field_obj = column_to_field[column]
+                        default = field_obj.default
+                        if callable(default):
+                            default = default()
+                        value = (
+                            field_obj.to_db_value(default, through_model)
+                            if default is not None
+                            else None
+                        )
+                    row.append(value)
+                query = query.insert(*row)
             await db.execute_query(*query.get_parameterized_sql())
 
     async def clear(self, using_db: BaseDBAsyncClient | None = None) -> None:

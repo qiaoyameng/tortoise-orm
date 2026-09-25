@@ -465,6 +465,41 @@ Sync usage requires that you call `fetch_related` before the time, and then you 
 
 The reverse lookup of ``team.event_team`` works exactly the same way.
 
+Adding instances with extra through fields
+==========================================
+
+When the through table is backed by an explicitly defined model (its ``Meta.table``
+matching the ``through`` of the ``ManyToManyField``) that carries extra fields such as
+``role`` or ``joined_at``, ``add()`` accepts a ``through_defaults`` keyword to populate
+them:
+
+.. code-block:: python3
+
+    await tournament.participants.add(team, through_defaults={"role": "admin"})
+
+Per-object values can be given by passing ``(instance, defaults)`` tuples, which are
+merged over the shared ``through_defaults``:
+
+.. code-block:: python3
+
+    await tournament.participants.add(
+        (team1, {"role": "admin"}),
+        team2,
+        through_defaults={"role": "member"},
+    )
+
+Notes:
+
+- Values are validated against the through model's fields before anything is written,
+  so an invalid value aborts the whole batch without inserting any relation.
+- Relations that already exist are silently ignored, as before; their through fields
+  are never updated.
+- Callable values are evaluated exactly once per actually inserted relation.
+- Fields not present in ``through_defaults`` fall back to the through field's default
+  (or ``None``), except fields with a DB-level default, which are left to the database.
+- ``through_defaults`` cannot set the two relation key columns, and requires an
+  explicit through model; an ``OperationalError`` is raised otherwise.
+
 Improving relational type hinting
 =================================
 

@@ -13,6 +13,7 @@ Changelog
 
 Added
 ^^^^^
+- ``ManyToManyRelation.add()`` now accepts ``through_defaults`` (and ``(instance, defaults)`` tuples for per-object values) to populate extra fields of an explicitly configured through model, validated before any insert and never updating already existing relations.
 - ``Q.__bool__()`` so ``Q`` objects with no filters/children (including nested empty ``Q`` children) are falsy. (#2227)
 - PostgreSQL ``password`` credential now accepts a sync or async callable, resolved once per new connection, to support short-lived credentials such as AWS RDS/Aurora IAM tokens and Azure Entra ID tokens. (#2261)
 
