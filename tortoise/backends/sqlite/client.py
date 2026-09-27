@@ -61,6 +61,7 @@ class SqliteClient(BaseDBAsyncClient):
         support_update_limit_order_by=False,
         can_rollback_ddl=True,
         support_returning=True,
+        max_query_params=999,
     )
 
     def __init__(self, file_path: str, **kwargs: Any) -> None:
@@ -287,6 +288,7 @@ class SqliteClientWithRegexpSupport(SqliteClient):
         support_for_posix_regex_queries=True,
         can_rollback_ddl=True,
         support_returning=True,
+        max_query_params=999,
     )
 
     async def create_connection(self, with_db: bool) -> None:

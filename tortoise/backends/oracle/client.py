@@ -38,7 +38,7 @@ class OracleClient(ODBCClient):
     query_class = OracleQuery
     schema_generator = OracleSchemaGenerator
     executor_class = OracleExecutor
-    capabilities = Capabilities(dialect="oracle")
+    capabilities = Capabilities(dialect="oracle", max_query_params=1000)
 
     def __init__(
         self,

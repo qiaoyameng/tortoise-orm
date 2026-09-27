@@ -15,6 +15,7 @@ Added
 ^^^^^
 - ``Q.__bool__()`` so ``Q`` objects with no filters/children (including nested empty ``Q`` children) are falsy. (#2227)
 - PostgreSQL ``password`` credential now accepts a sync or async callable, resolved once per new connection, to support short-lived credentials such as AWS RDS/Aurora IAM tokens and Azure Entra ID tokens. (#2261)
+- ``prefetch_related()`` now accepts a ``batch_size`` keyword and respects a new per-backend ``Capabilities.max_query_params`` budget: prefetch ``IN`` lookups are split into batches that fit the parameter limit (after subtracting the fixed parameters of the prefetch query itself) and merged, so large parent sets no longer exceed database parameter limits.
 
 Changed
 ^^^^^^^

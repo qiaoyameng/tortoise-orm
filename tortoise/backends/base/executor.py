@@ -20,6 +20,7 @@ from tortoise.fields.relational import (
     RelationalField,
 )
 from tortoise.query_utils import QueryModifier
+from tortoise.utils import chunk
 
 if TYPE_CHECKING:  # pragma: nocoverage
     from tortoise.backends.base.client import BaseDBAsyncClient
@@ -47,6 +48,7 @@ class BaseExecutor:
         db: BaseDBAsyncClient,
         prefetch_map: dict[str, set[str | Prefetch]] | None = None,
         prefetch_queries: dict[str, list[tuple[str | None, QuerySet]]] | None = None,
+        prefetch_batch_size: int | None = None,
         select_related_idx: (
             list[tuple[type[Model], int, str, type[Model], Iterable[str | None]]] | None
         ) = None,
@@ -55,6 +57,7 @@ class BaseExecutor:
         self.db: BaseDBAsyncClient = db
         self.prefetch_map = prefetch_map or {}
         self._prefetch_queries = prefetch_queries or {}
+        self.prefetch_batch_size = prefetch_batch_size
         self.select_related_idx = select_related_idx
         key = (self.db.connection_name, self.model._meta.schema, self.model._meta.db_table)
         if key not in EXECUTOR_CACHE:
@@ -512,6 +515,38 @@ class BaseExecutor:
             )
         )[0]
 
+    def _get_prefetch_batch_size(self, fixed_params: int = 0) -> int | None:
+        """
+        Return how many parent keys may be queried in a single prefetch query.
+
+        Combines the explicitly configured ``prefetch_batch_size`` with the
+        backend parameter budget (``capabilities.max_query_params``). The
+        budget is reduced by the number of fixed parameters the prefetch query
+        itself uses (filters, annotations, ...), so only the remainder is
+        available for parent keys. Returns ``None`` when no limit applies.
+        """
+        sizes: list[int] = []
+        if self.prefetch_batch_size:
+            sizes.append(self.prefetch_batch_size)
+        budget = self.db.capabilities.max_query_params
+        if budget:
+            sizes.append(max(1, budget - fixed_params))
+        if not sizes:
+            return None
+        return max(1, min(sizes))
+
+    @staticmethod
+    def _count_fixed_params(related_query: QuerySet) -> int:
+        """
+        Count the parameters a prefetch query uses excluding the parent key
+        ``IN`` lookup, i.e. the parameters contributed by the related query
+        itself (filters, annotations, ...).
+        """
+        probe = related_query.all()
+        probe._make_query()
+        _, params = probe.query.get_parameterized_sql()
+        return len(params)
+
     async def _prefetch_reverse_relation(
         self,
         instance_list: Iterable[Model],
@@ -519,34 +554,36 @@ class BaseExecutor:
         related_query: tuple[str | None, QuerySet],
     ) -> Iterable[Model]:
         to_attr, related_query = related_query
-        related_objects_for_fetch: dict[str, list] = {}
         related_field: BackwardFKRelation = self.model._meta.fields_map[field]  # type: ignore
         related_field_name = related_field.to_field_instance.model_field_name
         relation_field = related_field.relation_field
 
-        for instance in instance_list:
-            if relation_field not in related_objects_for_fetch:
-                related_objects_for_fetch[relation_field] = []
-            related_objects_for_fetch[relation_field].append(
+        # Deduplicate parent keys so repeated parents don't waste parameter slots.
+        relation_field_values = list(
+            dict.fromkeys(
                 instance._meta.fields_map[related_field_name].to_db_value(
                     getattr(instance, related_field_name), instance
                 )
+                for instance in instance_list
             )
+        )
 
         related_query.resolve_ordering(
             related_query.model, related_query.model._meta.basetable, [], {}
         )
-        related_object_list = await related_query.filter(
-            **{f"{k}__in": v for k, v in related_objects_for_fetch.items()}
-        )
+        batch_size = self._get_prefetch_batch_size(self._count_fixed_params(related_query))
 
         related_object_map: dict[str, list] = {}
-        for entry in related_object_list:
-            object_id = getattr(entry, relation_field)
-            if object_id in related_object_map:
-                related_object_map[object_id].append(entry)
-            else:
-                related_object_map[object_id] = [entry]
+        for value_batch in chunk(relation_field_values, batch_size):
+            related_object_list = await related_query.filter(
+                **{f"{relation_field}__in": list(value_batch)}
+            )
+            for entry in related_object_list:
+                object_id = getattr(entry, relation_field)
+                if object_id in related_object_map:
+                    related_object_map[object_id].append(entry)
+                else:
+                    related_object_map[object_id] = [entry]
         for instance in instance_list:
             relation_container = getattr(instance, field)
             relation_container._set_result_for_query(
@@ -562,28 +599,29 @@ class BaseExecutor:
         related_query: tuple[str | None, QuerySet],
     ) -> Iterable[Model]:
         to_attr, related_query = related_query
-        related_objects_for_fetch: dict[str, list] = {}
         related_field: BackwardOneToOneRelation = self.model._meta.fields_map[field]  # type: ignore
         related_field_name = related_field.to_field_instance.model_field_name
         relation_field = related_field.relation_field
 
-        for instance in instance_list:
-            if relation_field not in related_objects_for_fetch:
-                related_objects_for_fetch[relation_field] = []
-            related_objects_for_fetch[relation_field].append(
+        relation_field_values = list(
+            dict.fromkeys(
                 instance._meta.fields_map[related_field_name].to_db_value(
                     getattr(instance, related_field_name), instance
                 )
+                for instance in instance_list
             )
-
-        related_object_list = await related_query.filter(
-            **{f"{k}__in": v for k, v in related_objects_for_fetch.items()}
         )
 
+        batch_size = self._get_prefetch_batch_size(self._count_fixed_params(related_query))
+
         related_object_map = {}
-        for entry in related_object_list:
-            object_id = getattr(entry, relation_field)
-            related_object_map[object_id] = entry
+        for value_batch in chunk(relation_field_values, batch_size):
+            related_object_list = await related_query.filter(
+                **{f"{relation_field}__in": list(value_batch)}
+            )
+            for entry in related_object_list:
+                object_id = getattr(entry, relation_field)
+                related_object_map[object_id] = entry
 
         for instance in instance_list:
             obj = related_object_map.get(getattr(instance, related_field_name), None)
@@ -603,60 +641,78 @@ class BaseExecutor:
         related_query: tuple[str | None, QuerySet],
     ) -> Iterable[Model]:
         to_attr, related_query = related_query
-        instance_id_set: set = {
-            instance._meta.pk.to_db_value(instance.pk, instance) for instance in instance_list
-        }
+        # Deduplicate parent keys (preserving order) so repeated parents don't
+        # waste parameter slots.
+        instance_id_list: list = list(
+            dict.fromkeys(
+                instance._meta.pk.to_db_value(instance.pk, instance) for instance in instance_list
+            )
+        )
 
         field_object: ManyToManyFieldInstance = self.model._meta.fields_map[field]  # type: ignore
 
         through_table = Table(field_object.through, schema=field_object.through_schema)
-
-        subquery = (
-            self.db.query_class.from_(through_table)
-            .select(
-                through_table[field_object.backward_key].as_("_backward_relation_key"),
-                through_table[field_object.forward_key].as_("_forward_relation_key"),
-            )
-            .where(through_table[field_object.backward_key].isin(instance_id_set))
-        )
-
         related_query_table = related_query.model._meta.basetable
         related_pk_field = related_query.model._meta.db_pk_column
         related_query.resolve_ordering(related_query.model, related_query_table, [], {})
-        query = (
-            related_query.query.join(subquery)
-            .on(subquery._forward_relation_key == related_query_table[related_pk_field])
-            .select(
-                subquery._backward_relation_key.as_("_backward_relation_key"),
-                *[related_query_table[field].as_(field) for field in related_query.fields],
-            )
-        )
 
-        if related_query._q_objects:
-            joined_tables: list[Table] = []
-            modifier = QueryModifier()
-            for node in related_query._q_objects:
-                modifier &= node.resolve(
-                    ResolveContext(
-                        model=related_query.model,
-                        table=related_query_table,
-                        annotations=related_query._annotations,
-                        custom_filters=related_query._custom_filters,
-                    )
+        def build_query(instance_ids: list) -> QueryBuilder:
+            subquery = (
+                self.db.query_class.from_(through_table)
+                .select(
+                    through_table[field_object.backward_key].as_("_backward_relation_key"),
+                    through_table[field_object.forward_key].as_("_forward_relation_key"),
                 )
+                .where(through_table[field_object.backward_key].isin(instance_ids))
+            )
 
-            for join in modifier.joins:
-                if join[0] not in joined_tables:
-                    query = query.join(join[0], how=JoinType.left_outer).on(join[1])
-                    joined_tables.append(join[0])
+            query = (
+                related_query.query.join(subquery)
+                .on(subquery._forward_relation_key == related_query_table[related_pk_field])
+                .select(
+                    subquery._backward_relation_key.as_("_backward_relation_key"),
+                    *[related_query_table[field].as_(field) for field in related_query.fields],
+                )
+            )
 
-            if modifier.where_criterion:
-                query = query.where(modifier.where_criterion)
+            if related_query._q_objects:
+                joined_tables: list[Table] = []
+                modifier = QueryModifier()
+                for node in related_query._q_objects:
+                    modifier &= node.resolve(
+                        ResolveContext(
+                            model=related_query.model,
+                            table=related_query_table,
+                            annotations=related_query._annotations,
+                            custom_filters=related_query._custom_filters,
+                        )
+                    )
 
-            if modifier.having_criterion:
-                query = query.having(modifier.having_criterion)
+                for join in modifier.joins:
+                    if join[0] not in joined_tables:
+                        query = query.join(join[0], how=JoinType.left_outer).on(join[1])
+                        joined_tables.append(join[0])
 
-        _, raw_results = await self.db.execute_query(*query.get_parameterized_sql())
+                if modifier.where_criterion:
+                    query = query.where(modifier.where_criterion)
+
+                if modifier.having_criterion:
+                    query = query.having(modifier.having_criterion)
+            return query
+
+        # The fixed parameters of the query itself (filters, annotations, ...)
+        # consume part of the parameter budget; only the remainder is available
+        # for parent keys.
+        _, probe_params = build_query(instance_id_list[:1]).get_parameterized_sql()
+        batch_size = self._get_prefetch_batch_size(len(probe_params) - 1)
+
+        raw_results: list[dict] = []
+        for id_batch in chunk(instance_id_list, batch_size):
+            _, batch_results = await self.db.execute_query(
+                *build_query(list(id_batch)).get_parameterized_sql()
+            )
+            raw_results.extend(batch_results)
+
         relations: list[tuple[Any, Any]] = []
         related_object_list: list[Model] = []
         model_pk, related_pk = self.model._meta.pk, field_object.related_model._meta.pk
@@ -668,7 +724,10 @@ class BaseExecutor:
             relations.append(pk_values)
             related_object_list.append(related_query.model._init_from_db(**e))
         await self.__class__(
-            model=related_query.model, db=self.db, prefetch_map=related_query._prefetch_map
+            model=related_query.model,
+            db=self.db,
+            prefetch_map=related_query._prefetch_map,
+            prefetch_batch_size=self.prefetch_batch_size,
         )._execute_prefetch_queries(related_object_list)
         related_object_map = {e.pk: e for e in related_object_list}
         relation_map: dict[str, list] = {}
@@ -715,7 +774,25 @@ class BaseExecutor:
                 else:
                     k += "__in"
                 conditions[k] = v
-            related_object_list = await related_queryset.filter(**conditions)
+            batch_size = self._get_prefetch_batch_size(self._count_fixed_params(related_queryset))
+            if not batch_size or all(
+                len(values) <= batch_size for values in related_objects_for_fetch.values()
+            ):
+                related_object_list = await related_queryset.filter(**conditions)
+            else:
+                # Split the parent keys of each relation field into batches that
+                # fit the parameter budget and merge the results.
+                related_object_list = []
+                for key, values in related_objects_for_fetch.items():
+                    for value_batch in chunk(values, batch_size):
+                        value_batch = list(value_batch)
+                        if len(value_batch) == 1:
+                            batch_conditions = {key: value_batch[0]}
+                        else:
+                            batch_conditions = {f"{key}__in": value_batch}
+                        related_object_list.extend(
+                            await related_queryset.filter(**batch_conditions)
+                        )
             if len(model_to_field) > 1:
                 related_object_map = {
                     getattr(obj, model_to_field[obj.__class__]): obj for obj in related_object_list

@@ -144,6 +144,20 @@ General rule about how ``prefetch_related()`` works is that each level of depth 
 produces 1 additional query, so ``.prefetch_related('events__participants')`` will produce two
 additional queries to fetch your data.
 
+If a lot of parent objects are prefetched at once, the ``IN`` lookup of a prefetch query may
+contain more parameters than the database allows. To prevent this, prefetch queries are
+automatically split into batches that fit the backend parameter budget
+(``Capabilities.max_query_params``), after subtracting the fixed parameters the prefetch query
+itself uses. You can also cap the number of parent objects resolved per query explicitly:
+
+.. code-block:: python3
+
+    # Fetch events for the tournaments in batches of at most 500 parents per query
+    tournament_list = await Tournament.all().prefetch_related('events', batch_size=500)
+
+Batching is transparent: related objects are merged before being assigned, so attribution,
+ordering, ``to_attr`` and nested prefetches behave exactly as without batching.
+
 Sometimes, when performance is crucial, you don't want to make additional queries like this.
 In cases like this you could use ``values()`` or ``values_list()`` to produce more efficient query
 

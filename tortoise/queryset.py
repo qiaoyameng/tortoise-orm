@@ -64,7 +64,7 @@ class QuerySetSingle(Protocol[T_co]):
     def sql(self, params_inline=False) -> str: ...  # pragma: nocoverage
 
     def prefetch_related(
-        self, *args: str | Prefetch
+        self, *args: str | Prefetch, batch_size: int | None = None
     ) -> QuerySetSingle[T_co]: ...  # pragma: nocoverage
 
     def select_related(self, *args: str) -> QuerySetSingle[T_co]: ...  # pragma: nocoverage
@@ -351,6 +351,7 @@ class QuerySet(AwaitableQuery[MODEL]):
         "fields",
         "_prefetch_map",
         "_prefetch_queries",
+        "_prefetch_batch_size",
         "_single",
         "_raise_does_not_exist",
         "_db",
@@ -378,6 +379,7 @@ class QuerySet(AwaitableQuery[MODEL]):
         self.fields: set[str] = model._meta.db_fields
         self._prefetch_map: dict[str, set[str | Prefetch]] = {}
         self._prefetch_queries: dict[str, list[tuple[str | None, QuerySet]]] = {}
+        self._prefetch_batch_size: int | None = None
         self._single: bool = False
         self._raise_does_not_exist: bool = False
         self._limit: int | None = None
@@ -408,6 +410,7 @@ class QuerySet(AwaitableQuery[MODEL]):
         queryset.capabilities = self.capabilities
         queryset._prefetch_map = copy(self._prefetch_map)
         queryset._prefetch_queries = copy(self._prefetch_queries)
+        queryset._prefetch_batch_size = self._prefetch_batch_size
         queryset._single = self._single
         queryset._raise_does_not_exist = self._raise_does_not_exist
         queryset._db = self._db
@@ -1081,14 +1084,25 @@ class QuerySet(AwaitableQuery[MODEL]):
             return queryset
         return self
 
-    def prefetch_related(self, *args: str | Prefetch) -> QuerySet[MODEL]:
+    def prefetch_related(
+        self, *args: str | Prefetch, batch_size: int | None = None
+    ) -> QuerySet[MODEL]:
         """
         Like ``.fetch_related()`` on instance, but works on all objects in QuerySet.
 
+        :param batch_size: Maximum number of parent objects to resolve in a single
+            prefetch query. The related objects are fetched in multiple queries and
+            merged, so the result is the same as without batching. The effective
+            batch size is also capped by the backend parameter budget
+            (``capabilities.max_query_params``).
         :raises FieldError: If the field to prefetch on is not a relation, or not found.
+        :raises ValueError: If ``batch_size`` is smaller than 1.
         """
+        if batch_size is not None and batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
         queryset = self._clone()
         queryset._prefetch_map = {}
+        queryset._prefetch_batch_size = batch_size
 
         for relation in args:
             if isinstance(relation, Prefetch):
@@ -1332,6 +1346,7 @@ class QuerySet(AwaitableQuery[MODEL]):
             db=self._db,
             prefetch_map=self._prefetch_map,
             prefetch_queries=self._prefetch_queries,
+            prefetch_batch_size=self._prefetch_batch_size,
             select_related_idx=self._select_related_idx,  # type: ignore
         ).execute_select(
             *self.query.get_parameterized_sql(),

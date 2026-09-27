@@ -53,6 +53,7 @@ class BasePostgresClient(BaseDBAsyncClient, abc.ABC):
         support_json_attributes=True,
         can_rollback_ddl=True,
         support_returning=True,
+        max_query_params=32767,
     )
     connection_class: AsyncConnection | Connection | None = None
     loop: AbstractEventLoop | None = None

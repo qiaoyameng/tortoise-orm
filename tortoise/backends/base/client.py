@@ -65,6 +65,9 @@ class Capabilities:
     :param can_rollback_ddl: Whether the database supports transactional DDL.
         Used to determine if migrations can be run atomically.
     :param support_returning: Indicates that this DB supports INSERT ... RETURNING.
+    :param max_query_params: Maximum number of parameters the backend accepts in a single
+        query. Used to batch prefetch ``IN`` lookups so they stay within the limit.
+        ``None`` means no known limit.
     """
 
     def __init__(
@@ -87,6 +90,7 @@ class Capabilities:
         support_json_attributes: bool = False,
         can_rollback_ddl: bool = False,
         support_returning: bool = False,
+        max_query_params: int | None = None,
     ) -> None:
         super().__setattr__("_mutable", True)
 
@@ -103,6 +107,7 @@ class Capabilities:
         self.support_json_attributes = support_json_attributes
         self.can_rollback_ddl = can_rollback_ddl
         self.support_returning = support_returning
+        self.max_query_params = max_query_params
         super().__setattr__("_mutable", False)
 
     def __setattr__(self, attr: str, value: Any) -> None:

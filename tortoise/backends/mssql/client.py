@@ -30,6 +30,7 @@ class MSSQLClient(ODBCClient):
         support_update_limit_order_by=False,
         support_for_update=False,
         support_json_attributes=True,
+        max_query_params=2100,
     )
 
     def __init__(
