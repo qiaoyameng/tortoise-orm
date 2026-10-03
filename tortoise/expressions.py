@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import operator
+import re
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Sequence, cast
 
 from pypika_tortoise import Case as PypikaCase
+from pypika_tortoise import Dialects
 from pypika_tortoise import Field as PypikaField
 from pypika_tortoise import SqlContext, Table
 from pypika_tortoise.functions import AggregateFunction, DistinctOptionFunction
@@ -250,6 +253,192 @@ class RawSQL(Term):
         if ctx.with_alias:
             return format_alias_sql(sql=self.sql, alias=self.alias, ctx=ctx)
         return self.sql
+
+
+_JSON_SAFE_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _encode_json_path(path: Sequence[str | int]) -> str:
+    """
+    Encode a structured JSON path (a sequence of string keys and integer array
+    indices) into SQLite JSON path syntax.
+
+    Keys that are not simple identifiers are quoted, so keys containing dots,
+    quotes or backslashes address a single literal key instead of being parsed
+    as path syntax. The returned string is meant to be used as a bound
+    parameter, never interpolated into SQL.
+    """
+    if isinstance(path, str):
+        raise TypeError(
+            "JSON path must be a sequence of keys/indices, e.g. ['a', 'b'], "
+            "not a plain string"
+        )
+    if not path:
+        raise ValueError("JSON path must contain at least one key or array index")
+    encoded = ["$"]
+    for part in path:
+        if isinstance(part, bool):
+            raise TypeError(f"JSON path parts must be str or int, not {part!r}")
+        if isinstance(part, int):
+            if part < 0:
+                raise ValueError(f"Negative array indices are not supported in JSON paths: {part}")
+            encoded.append(f"[{part}]")
+        elif isinstance(part, str):
+            if _JSON_SAFE_KEY_RE.match(part):
+                encoded.append(f".{part}")
+            else:
+                escaped = part.replace("\\", "\\\\").replace('"', '\\"')
+                encoded.append(f'."{escaped}"')
+        else:
+            raise TypeError(f"JSON path parts must be str or int, not {type(part).__name__}")
+    return "".join(encoded)
+
+
+class _JSONUpdateTerm(Term):
+    """
+    Pypika term rendering a JSON document update as a single SQL function call,
+    e.g. ``json_set("data", ?, json(?), ?, json(?))`` or ``json_remove("data", ?, ?)``.
+
+    Both the encoded paths and the JSON-serialized values are rendered through
+    ``ValueWrapper`` so they are emitted as bound parameters whenever the query
+    is parameterized; path text can therefore never alter the SQL structure.
+    Values are wrapped in SQLite's ``json()`` so that booleans, numbers, null
+    and nested structures keep their JSON type instead of being coerced by the
+    driver (e.g. Python ``True`` would otherwise be stored as integer ``1``).
+    """
+
+    is_aggregate = None
+
+    def __init__(
+        self,
+        column: Term,
+        function_name: str,
+        operations: list[tuple[str, str | None]],
+    ) -> None:
+        super().__init__()
+        self.column = column
+        self.function_name = function_name
+        # Each operation is (encoded_path, json_serialized_value); a value of
+        # None marks a removal operation which takes no value argument.
+        self.operations = operations
+
+    def get_sql(self, ctx: SqlContext) -> str:
+        if ctx.dialect != Dialects.SQLITE:
+            raise OperationalError(
+                f"{type(self).__name__} ({self.function_name}) is only supported on SQLite "
+                f"for now, not on dialect {ctx.dialect.value!r}. The query is not executed "
+                "and no read-modify-write fallback is attempted, since that could lose "
+                "concurrent updates."
+            )
+        args = [self.column.get_sql(ctx)]
+        for path, json_value in self.operations:
+            args.append(ValueWrapper(path).get_sql(ctx))
+            if json_value is not None:
+                args.append(f"json({ValueWrapper(json_value).get_sql(ctx)})")
+        return f"{self.function_name}({', '.join(args)})"
+
+
+class _JSONUpdateExpression(Expression):
+    """
+    Base class for in-place JSON document updates on a ``JSONField``.
+
+    The update runs as a single SQL statement (``json_set``/``json_remove`` on
+    SQLite), so concurrent updates to different paths of the same document do
+    not overwrite each other, unlike a read-modify-write cycle in Python.
+
+    Semantics (SQLite):
+
+    - Missing parent objects along the path are created as needed.
+    - An array index beyond the end of the array is a no-op; the row is left
+      unchanged (no padding, no error).
+    - If the column value is SQL ``NULL``, the update is a no-op and the value
+      stays ``NULL``.
+    - Multiple operations in one expression are applied left to right, in the
+      order they were passed; later operations observe the results of earlier
+      ones.
+    """
+
+    function_name: str
+
+    def __init__(self, field: str) -> None:
+        self.field = field
+        self.operations: list[tuple[str, str | None]] = []
+
+    def resolve(self, resolve_context: ResolveContext) -> ResolveResult:
+        term, joins, output_field = resolve_nested_field(
+            resolve_context.model, resolve_context.table, self.field
+        )
+        if not isinstance(output_field, JSONField):
+            raise FieldError(
+                f"{type(self).__name__} can only be used on a JSONField, "
+                f"but {self.field!r} is {type(output_field).__name__}"
+            )
+        return ResolveResult(
+            term=_JSONUpdateTerm(term, self.function_name, self.operations),
+            joins=joins,
+            output_field=output_field,
+        )
+
+
+class JSONSet(_JSONUpdateExpression):
+    """
+    Set one or more paths of a ``JSONField`` in place, without reading and
+    rewriting the whole document::
+
+        await MyModel.filter(pk=1).update(
+            data=JSONSet("data", (["profile", "name"], "Ada"), (["tags", 0], "x"))
+        )
+
+    :param field: Name of the JSONField to update.
+    :param operations: ``(path, value)`` pairs. Each path is a sequence of
+        string keys and integer array indices; keys containing dots, quotes or
+        other special characters are encoded safely and passed as bound
+        parameters. Values may be any JSON-serializable object and keep their
+        JSON type (bool, number, null, string, object, array).
+
+    Currently only executable on SQLite; other backends raise
+    ``OperationalError`` instead of falling back to a lossy read-modify-write.
+    """
+
+    function_name = "json_set"
+
+    def __init__(self, field: str, *operations: tuple[Sequence[str | int], Any]) -> None:
+        super().__init__(field)
+        if not operations:
+            raise ValueError(f"{type(self).__name__} requires at least one (path, value) pair")
+        for path, value in operations:
+            try:
+                json_value = json.dumps(value)
+            except (TypeError, ValueError) as exc:
+                raise FieldError(
+                    f"Value {value!r} for JSON path {list(path)!r} is not JSON serializable"
+                ) from exc
+            self.operations.append((_encode_json_path(path), json_value))
+
+
+class JSONRemove(_JSONUpdateExpression):
+    """
+    Remove one or more paths from a ``JSONField`` in place::
+
+        await MyModel.filter(pk=1).update(data=JSONRemove("data", ["profile", "age"]))
+
+    :param field: Name of the JSONField to update.
+    :param paths: Paths to remove, each a sequence of string keys and integer
+        array indices. Removing a path that does not exist (including an
+        out-of-bounds array index) is a no-op.
+
+    Currently only executable on SQLite; other backends raise
+    ``OperationalError`` instead of falling back to a lossy read-modify-write.
+    """
+
+    function_name = "json_remove"
+
+    def __init__(self, field: str, *paths: Sequence[str | int]) -> None:
+        super().__init__(field)
+        if not paths:
+            raise ValueError(f"{type(self).__name__} requires at least one path")
+        for path in paths:
+            self.operations.append((_encode_json_path(path), None))
 
 
 class Q:

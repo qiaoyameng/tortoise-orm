@@ -120,6 +120,41 @@ RawSQL provides the capability to execute raw SQL queries within ``filter()`` an
     await Tournament.filter(pk=1).annotate(idp=RawSQL('id + 1')).filter(idp=2).values("idp")
     await Tournament.filter(pk=RawSQL("id + 1"))
 
+JSONSet / JSONRemove
+====================
+
+``JSONSet`` and ``JSONRemove`` update one or more paths of a ``JSONField`` in place,
+as a single SQL statement, without reading and rewriting the whole document. This
+avoids lost updates when two requests modify different sub-fields of the same
+document concurrently:
+
+.. code-block:: python3
+
+    from tortoise.expressions import JSONRemove, JSONSet
+
+    await User.filter(pk=1).update(
+        data=JSONSet("data", (["profile", "name"], "Ada"), (["tags", 0], "admin"))
+    )
+    await User.filter(pk=1).update(data=JSONRemove("data", ["profile", "age"]))
+
+Each path is a sequence of string keys and integer array indices. Keys containing
+dots, quotes or other special characters are encoded safely, and both paths and
+values are sent to the database as bound parameters, so path text can never alter
+the SQL structure. Values may be any JSON-serializable object and keep their JSON
+type (bool, number, null, string, object, array).
+
+Semantics (SQLite):
+
+- Missing parent objects along the path are created as needed.
+- An array index beyond the end of the array is a no-op.
+- If the column value is SQL ``NULL``, the update is a no-op and stays ``NULL``.
+- Multiple operations in one expression are applied left to right, in the order
+  they were passed.
+
+These expressions are currently only executable on SQLite. On other backends they
+raise ``OperationalError`` instead of falling back to a read-modify-write cycle
+that could lose concurrent updates.
+
 Case-When Expression
 ====================
 
