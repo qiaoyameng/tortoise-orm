@@ -170,6 +170,36 @@ QuerySet also supports aggregation and database functions through ``.annotate()`
 
 Check `examples <https://github.com/tortoise/tortoise-orm/tree/master/examples>`_ to see it all in work
 
+.. _streaming-results:
+
+Streaming large resultsets
+==========================
+
+Awaiting a QuerySet (or using ``async for`` on it) reads the whole resultset into
+memory first. When exporting or processing large amounts of data, use
+``.iterator(chunk_size=...)`` to stream rows in batches from a database cursor
+instead:
+
+.. code-block:: python3
+
+    async for event in Event.all().iterator(chunk_size=1000):
+        ...
+
+    # values() and values_list() support it too, with the same field conversion
+    async for row in Event.all().values("id", "name").iterator(chunk_size=1000):
+        ...
+
+The cursor is owned by the iterator and is released when iteration completes,
+when the iterator is closed early (``await iterator.aclose()``), is cancelled, or
+raises. Inside a transaction the iterator reads from the transaction connection.
+
+Cursor iteration is only available on backends that declare the
+``support_cursor_iteration`` capability (currently SQLite); other backends raise
+``UnSupportedError`` rather than silently reading the whole table. Query
+combinations that are not supported yet — ``prefetch_related()``,
+``select_related()``, ``select_for_update()`` and single-object queries — raise
+``ParamsError`` before anything is executed.
+
 .. _foreign_key:
 
 Foreign Key

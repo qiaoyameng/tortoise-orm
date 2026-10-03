@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import types
 from collections import defaultdict
-from collections.abc import AsyncIterator, Callable, Collection, Generator, Iterable, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Collection,
+    Generator,
+    Iterable,
+    Sequence,
+)
 from copy import copy
 from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeVar, cast, overload
 
@@ -21,6 +29,7 @@ from tortoise.exceptions import (
     MultipleObjectsReturned,
     OperationalError,
     ParamsError,
+    UnSupportedError,
 )
 from tortoise.expressions import Expression, Q, RawSQL, ResolveContext, ResolveResult, Value
 from tortoise.fields.base import DatabaseDefault
@@ -51,6 +60,18 @@ MODEL = TypeVar("MODEL", bound="Model")
 PRIMARY_KEY = TypeVar("PRIMARY_KEY")
 T_co = TypeVar("T_co", covariant=True)
 SINGLE = TypeVar("SINGLE", bound=bool)
+
+
+def _validate_iterator_chunk_size(chunk_size: int) -> None:
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
+        raise ParamsError("iterator() chunk_size must be a positive integer")
+
+
+def _check_cursor_capability(db: BaseDBAsyncClient) -> None:
+    if not db.capabilities.support_cursor_iteration:
+        raise UnSupportedError(
+            f"iterator() is not supported by the {db.capabilities.dialect!r} backend"
+        )
 
 
 class QuerySetSingle(Protocol[T_co]):
@@ -1326,6 +1347,54 @@ class QuerySet(AwaitableQuery[MODEL]):
         for val in await self:
             yield val
 
+    def iterator(self, chunk_size: int = 2000) -> AsyncGenerator[MODEL, None]:
+        """
+        Returns an async iterator that fetches rows from the database in batches of
+        ``chunk_size``, reading incrementally from a cursor instead of loading the
+        whole resultset into memory like ``async for`` on the QuerySet does.
+
+        The cursor is owned by the returned iterator and is released when iteration
+        completes, when the iterator is closed early (``aclose()``), cancelled, or
+        fails. Inside a transaction the iterator reads from the transaction
+        connection.
+
+        :param chunk_size: Maximum number of rows fetched from the cursor per batch.
+        :raises ParamsError: If the query uses ``prefetch_related()``,
+            ``select_related()``, ``select_for_update()`` or a single-object query,
+            which are not supported by cursor iteration yet.
+        :raises UnSupportedError: If the database backend does not support cursor
+            iteration (see ``capabilities.support_cursor_iteration``).
+        """
+        _validate_iterator_chunk_size(chunk_size)
+        if self._prefetch_map or self._prefetch_queries:
+            raise ParamsError("iterator() does not support prefetch_related() yet")
+        if self._select_related:
+            raise ParamsError("iterator() does not support select_related() yet")
+        if self._select_for_update:
+            raise ParamsError("iterator() does not support select_for_update()")
+        if self._single:
+            raise ParamsError("iterator() does not support single-object queries")
+        if self._db is None:
+            self._db = self._choose_db(self._select_for_update)  # type: ignore[unreachable]
+        _check_cursor_capability(self._db)
+        self._make_query()
+        return self._iterate(chunk_size)
+
+    async def _iterate(self, chunk_size: int) -> AsyncGenerator[MODEL, None]:
+        custom_fields = list(self._annotations.keys())
+        batches = self._db.execute_query_cursor(
+            *self.query.get_parameterized_sql(), chunk_size=chunk_size
+        )
+        try:
+            async for batch in batches:
+                for row in batch:
+                    instance = self.model._init_from_db(**row)
+                    for field in custom_fields:
+                        object.__setattr__(instance, field, row[field])
+                    yield instance
+        finally:
+            await batches.aclose()
+
     async def _execute(self) -> list[MODEL]:
         instance_list = await self._db.executor_class(
             model=self.model,
@@ -1862,6 +1931,40 @@ class ValuesListQuery(FieldSelectQuery, Generic[SINGLE]):
         for val in await self:
             yield val
 
+    def iterator(self, chunk_size: int = 2000) -> AsyncGenerator[Any, None]:
+        """
+        Returns an async iterator that fetches rows from the database in batches of
+        ``chunk_size``, applying the same field conversion rules as awaiting the
+        query, without loading the whole resultset into memory.
+
+        :param chunk_size: Maximum number of rows fetched from the cursor per batch.
+        :raises UnSupportedError: If the database backend does not support cursor
+            iteration (see ``capabilities.support_cursor_iteration``).
+        """
+        _validate_iterator_chunk_size(chunk_size)
+        self._choose_db_if_not_chosen()
+        _check_cursor_capability(self._db)
+        self._make_query()
+        return self._iterate(chunk_size)
+
+    async def _iterate(self, chunk_size: int) -> AsyncGenerator[Any, None]:
+        columns = [
+            (key, self.resolve_to_python_value(self.model, name))
+            for key, name in self.fields.items()
+        ]
+        batches = self._db.execute_query_cursor(
+            *self.query.get_parameterized_sql(), chunk_size=chunk_size
+        )
+        try:
+            async for batch in batches:
+                for entry in batch:
+                    if self._flat:
+                        yield columns[0][1](entry["0"])
+                    else:
+                        yield tuple(func(entry[column]) for column, func in columns)
+        finally:
+            await batches.aclose()
+
     async def _execute(self) -> list[Any] | tuple:
         _, result = await self._db.execute_query(*self.query.get_parameterized_sql())
         columns = [
@@ -1991,6 +2094,43 @@ class ValuesQuery(FieldSelectQuery, Generic[SINGLE]):
     async def __aiter__(self: ValuesQuery[Any]) -> AsyncIterator[dict[str, Any]]:
         for val in await self:
             yield val
+
+    def iterator(self, chunk_size: int = 2000) -> AsyncGenerator[dict[str, Any], None]:
+        """
+        Returns an async iterator that fetches rows from the database in batches of
+        ``chunk_size``, applying the same field conversion rules as awaiting the
+        query, without loading the whole resultset into memory.
+
+        :param chunk_size: Maximum number of rows fetched from the cursor per batch.
+        :raises UnSupportedError: If the database backend does not support cursor
+            iteration (see ``capabilities.support_cursor_iteration``).
+        """
+        _validate_iterator_chunk_size(chunk_size)
+        self._choose_db_if_not_chosen()
+        _check_cursor_capability(self._db)
+        self._make_query()
+        return self._iterate(chunk_size)
+
+    async def _iterate(self, chunk_size: int) -> AsyncGenerator[dict[str, Any], None]:
+        columns = [
+            val
+            for val in [
+                (alias, self.resolve_to_python_value(self.model, field_name))
+                for alias, field_name in self._fields_for_select.items()
+            ]
+            if not isinstance(val[1], types.LambdaType)
+        ]
+        batches = self._db.execute_query_cursor(
+            *self.query.get_parameterized_sql(), chunk_size=chunk_size
+        )
+        try:
+            async for batch in batches:
+                for row in batch:
+                    for col, func in columns:
+                        row[col] = func(row[col])
+                    yield row
+        finally:
+            await batches.aclose()
 
     async def _execute(self) -> list[dict] | dict:
         result = await self._db.execute_query_dict(*self.query.get_parameterized_sql())

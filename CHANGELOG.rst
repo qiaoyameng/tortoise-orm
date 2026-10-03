@@ -13,6 +13,7 @@ Changelog
 
 Added
 ^^^^^
+- ``QuerySet.iterator(chunk_size=...)`` (also on ``values()`` and ``values_list()``) streams rows in batches from a database cursor instead of loading the whole resultset, using the same field conversion rules. The cursor is owned by the iterator and released on completion, early ``aclose()``, cancellation, or conversion errors; inside a transaction the iterator reads from the transaction connection. Backends declare support via the new ``support_cursor_iteration`` capability (currently SQLite); unsupported backends raise ``UnSupportedError``, and unsupported query combinations (``prefetch_related()``, ``select_related()``, ``select_for_update()``, single-object queries) raise ``ParamsError`` before execution.
 - ``Q.__bool__()`` so ``Q`` objects with no filters/children (including nested empty ``Q`` children) are falsy. (#2227)
 - PostgreSQL ``password`` credential now accepts a sync or async callable, resolved once per new connection, to support short-lived credentials such as AWS RDS/Aurora IAM tokens and Azure Entra ID tokens. (#2261)
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import inspect
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from typing import Any, Generic, TypeAlias, TypeVar, cast
 
 from pypika_tortoise import Query
@@ -65,6 +65,8 @@ class Capabilities:
     :param can_rollback_ddl: Whether the database supports transactional DDL.
         Used to determine if migrations can be run atomically.
     :param support_returning: Indicates that this DB supports INSERT ... RETURNING.
+    :param support_cursor_iteration: Indicates that this DB supports streaming query
+        results in batches from a cursor (``QuerySet.iterator()``).
     """
 
     def __init__(
@@ -87,6 +89,7 @@ class Capabilities:
         support_json_attributes: bool = False,
         can_rollback_ddl: bool = False,
         support_returning: bool = False,
+        support_cursor_iteration: bool = False,
     ) -> None:
         super().__setattr__("_mutable", True)
 
@@ -103,6 +106,7 @@ class Capabilities:
         self.support_json_attributes = support_json_attributes
         self.can_rollback_ddl = can_rollback_ddl
         self.support_returning = support_returning
+        self.support_cursor_iteration = support_cursor_iteration
         super().__setattr__("_mutable", False)
 
     def __setattr__(self, attr: str, value: Any) -> None:
@@ -278,6 +282,25 @@ class BaseDBAsyncClient(abc.ABC):
         rowcount, rows = await self.execute_query(query, values)
         normalized = [dict(row) for row in rows]
         return normalized, rowcount
+
+    def execute_query_cursor(
+        self, query: str, values: list | None = None, chunk_size: int = 2000
+    ) -> AsyncGenerator[list[dict], None]:
+        """
+        Executes a RAW SQL query statement, and yields the resultset in batches of
+        up to ``chunk_size`` rows, read incrementally from a cursor owned by the
+        returned async generator.
+
+        The cursor is released when the generator is exhausted, closed, or fails.
+        Backends must only implement this when the underlying driver can fetch rows
+        incrementally on the current connection; it must never be emulated by
+        reading the whole resultset into memory.
+
+        :param query: The SQL string, pre-parametrized for the target DB dialect.
+        :param values: A sequence of positional DB parameters.
+        :param chunk_size: Maximum number of rows to fetch per batch.
+        """
+        raise NotImplementedError()  # pragma: nocoverage
 
 
 class TransactionalDBClient(BaseDBAsyncClient, abc.ABC):
