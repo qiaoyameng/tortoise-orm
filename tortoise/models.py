@@ -39,6 +39,7 @@ from tortoise.fields.relational import (
     ReverseRelation,
 )
 from tortoise.filters import FilterInfoDict, get_filters_for_field
+from tortoise.identity import _suppress_identity_scope, current_scope
 from tortoise.indexes import Index
 from tortoise.manager import Manager
 from tortoise.queryset import (
@@ -818,7 +819,9 @@ class Model(metaclass=ModelMeta):
         return Table(name=cls._meta.db_table, schema=cls._meta.schema)
 
     @classmethod
-    def _init_from_db(cls: type[MODEL], **kwargs: Any) -> MODEL:
+    def _init_from_db(
+        cls: type[MODEL], _db: BaseDBAsyncClient | None = None, **kwargs: Any
+    ) -> MODEL:
         self = cls.__new__(cls)
         self._partial = False
         self._saved_in_db = True
@@ -827,6 +830,7 @@ class Model(metaclass=ModelMeta):
 
         meta = self._meta
         _setattr = object.__setattr__  # bypass __setattr__ override for performance
+        loaded_fields: list[str] | None = None  # None means "all db fields" (fast path)
         try:
             # This is like so for performance reasons.
             #  We want to avoid conditionals and calling .to_python_value()
@@ -846,6 +850,7 @@ class Model(metaclass=ModelMeta):
         except KeyError:
             # Partial model (.only() query) — slower but correct fallback
             self._partial = True
+            loaded_fields = []
             native_keys = {k for k, _, _ in meta.db_native_fields}
             default_keys = {k for k, _, _ in meta.db_default_fields}
             for key, value in kwargs.items():
@@ -859,7 +864,16 @@ class Model(metaclass=ModelMeta):
                     else:
                         value = field.to_python_value(value)
                 model_field = meta.fields_db_projection_reverse.get(key, key)
+                loaded_fields.append(model_field)
                 _setattr(self, model_field, value)
+
+        scope = current_scope()
+        if scope is not None:
+            if loaded_fields is None:
+                loaded_fields = list(meta.fields_db_projection)
+            return scope._register_or_merge(
+                cls, _db.connection_name if _db is not None else None, self, loaded_fields
+            )
 
         return self
 
@@ -1192,6 +1206,8 @@ class Model(metaclass=ModelMeta):
                 created = True
 
         self._saved_in_db = True
+        if (scope := current_scope()) is not None:
+            scope._on_save(self, db.connection_name)
         await self._post_save(db, created, update_fields)
 
     async def delete(self, using_db: BaseDBAsyncClient | None = None) -> None:
@@ -1207,6 +1223,8 @@ class Model(metaclass=ModelMeta):
             raise OperationalError("Can't delete unpersisted record")
         await self._pre_delete(db)
         await db.executor_class(model=self.__class__, db=db).execute_delete(self)
+        if (scope := current_scope()) is not None:
+            scope._evict(self.__class__, db.connection_name, self.pk)
         await self._post_delete(db)
 
     async def fetch_related(self, *args: Any, using_db: BaseDBAsyncClient | None = None) -> None:
@@ -1247,10 +1265,17 @@ class Model(metaclass=ModelMeta):
         qs = QuerySet(self.__class__).using_db(db)
         if fields:
             qs = qs.only(*fields)
-        obj = await qs.get(pk=self.pk)
+        scope = current_scope()
+        # Bypass the identity map for this query: refresh must always read the
+        # current database state, even if this instance is already mapped.
+        with _suppress_identity_scope():
+            obj = await qs.get(pk=self.pk)
 
         for field in fields or self._meta.db_fields:
             setattr(self, field, getattr(obj, field, None))
+        if scope is not None:
+            refreshed = list(fields) if fields else list(self._meta.fields_db_projection)
+            scope._on_refresh(self, refreshed, db.connection_name)
 
     @classmethod
     def _choose_db(cls, for_write: bool = False) -> BaseDBAsyncClient:

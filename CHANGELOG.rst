@@ -13,6 +13,7 @@ Changelog
 
 Added
 ^^^^^
+- ``identity_scope()``: an explicit, nestable, opt-in identity map. While a scope is active, rows materialized from the database (including ``.only()``, ``select_related`` and ``prefetch_related``) are keyed by ``(connection name, model, pk)`` and the same Python object is returned for the same row. Partial queries fill in not-yet-loaded fields without overwriting locally modified values; ``save()``/``delete()``/``refresh_from_db()`` keep the scope consistent. The scope is stored in a context variable, so concurrent async tasks (e.g. per-request) are isolated from each other.
 - ``Q.__bool__()`` so ``Q`` objects with no filters/children (including nested empty ``Q`` children) are falsy. (#2227)
 - PostgreSQL ``password`` credential now accepts a sync or async callable, resolved once per new connection, to support short-lived credentials such as AWS RDS/Aurora IAM tokens and Azure Entra ID tokens. (#2261)
 

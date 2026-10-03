@@ -127,7 +127,9 @@ class BaseExecutor:
             if self.select_related_idx:
                 _, current_idx, _, _, path = self.select_related_idx[0]
                 row_items = list(dict(row).items())
-                instance: Model = self.model._init_from_db(**dict(row_items[:current_idx]))
+                instance: Model = self.model._init_from_db(
+                    _db=self.db, **dict(row_items[:current_idx])
+                )
                 instances: dict[Any, Any] = {path: instance}
                 for model, index, *__, full_path in self.select_related_idx[1:]:
                     (*path, attr) = full_path
@@ -139,12 +141,12 @@ class BaseExecutor:
                             if fname is None:
                                 fname = _split_cache[k] = k.split(".", 1)[1]
                             related_kwargs[fname] = v
-                        obj = model._init_from_db(**related_kwargs)
+                        obj = model._init_from_db(_db=self.db, **related_kwargs)
                     elif index == 0:
                         # 0 signals that an empty "filler" object should be created in the case
                         # where a field of related model is selected but model itself isn't,
                         # e.g. .only("relatedmodel__field")
-                        obj = model._init_from_db()
+                        obj = model._init_from_db(_db=self.db)
                     else:
                         obj = None
                     target = instances.get(tuple(path))
@@ -154,7 +156,7 @@ class BaseExecutor:
                         instances[(*path, attr)] = obj
                     current_idx += index
             else:
-                instance = self.model._init_from_db(**row)
+                instance = self.model._init_from_db(_db=self.db, **row)
             if custom_fields:
                 for field in custom_fields:
                     object.__setattr__(instance, field, row[field])
@@ -184,7 +186,7 @@ class BaseExecutor:
                         for field in row.keys()
                         if field not in [model_field, app_field]
                     }
-                    instance_list.append(model._init_from_db(**row))
+                    instance_list.append(model._init_from_db(_db=self.db, **row))
                     break
 
         return instance_list
@@ -666,7 +668,7 @@ class BaseExecutor:
                 related_pk.to_python_value(e[related_pk_field]),
             )
             relations.append(pk_values)
-            related_object_list.append(related_query.model._init_from_db(**e))
+            related_object_list.append(related_query.model._init_from_db(_db=self.db, **e))
         await self.__class__(
             model=related_query.model, db=self.db, prefetch_map=related_query._prefetch_map
         )._execute_prefetch_queries(related_object_list)

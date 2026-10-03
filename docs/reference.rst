@@ -17,6 +17,7 @@ Reference
    functions
    expressions
    transactions
+   identity_scope
    connections
    exceptions
    signals
