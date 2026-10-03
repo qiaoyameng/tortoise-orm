@@ -1220,3 +1220,56 @@ class Drink(Model):
     toppings = fields.ManyToManyField(
         Flavor, related_name="topping_drinks", through="drink_topping"
     )
+
+
+class CompositePkModel(Model):
+    tenant_id = fields.IntField()
+    code = fields.CharField(max_length=40)
+    name = fields.CharField(max_length=100, null=True)
+
+    class Meta:
+        table = "composite_pk_model"
+        primary_key = ("tenant_id", "code")
+
+
+class CpkFkParent(Model):
+    id = fields.IntField(primary_key=True)
+    label = fields.CharField(max_length=50)
+
+    class Meta:
+        table = "cpk_fk_parent"
+
+
+class CpkFkChild(Model):
+    tenant_id = fields.IntField()
+    code = fields.CharField(max_length=40)
+    parent = fields.ForeignKeyField("models.CpkFkParent", related_name="cpk_children", null=True)
+
+    class Meta:
+        table = "cpk_fk_child"
+        primary_key = ("tenant_id", "code")
+
+
+class AbstractCompositeModel(Model):
+    tenant_id = fields.IntField()
+    code = fields.CharField(max_length=40)
+
+    class Meta:
+        abstract = True
+        primary_key = ("tenant_id", "code")
+
+
+class InheritedCompositeModel(AbstractCompositeModel):
+    name = fields.CharField(max_length=20, null=True)
+
+    class Meta:
+        table = "inherited_composite_model"
+
+
+class SourceFieldComposite(Model):
+    tenant = fields.IntField(source_field="t_id")
+    code = fields.CharField(max_length=40, source_field="c_code")
+
+    class Meta:
+        table = "source_field_composite"
+        primary_key = ("tenant", "code")

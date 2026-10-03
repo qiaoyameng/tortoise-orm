@@ -278,6 +278,60 @@ class FilterInfoDict(TypedDict):
     value_encoder: NotRequired[Callable]
     source_field: NotRequired[str]
     is_tsvector: NotRequired[bool]
+    composite_pk: NotRequired[tuple[str, ...]]
+
+
+def composite_pk_eq(fields: Sequence[Term], value: Sequence[Any]) -> Criterion:
+    criterion: Criterion | None = None
+    for field, part in zip(fields, value):
+        part_criterion = field.eq(part)
+        criterion = part_criterion if criterion is None else criterion & part_criterion
+    return criterion  # type: ignore[return-value]
+
+
+def composite_pk_ne(fields: Sequence[Term], value: Sequence[Any]) -> Criterion:
+    # SQL NULL semantics: NOT (a = ? AND b = ?)
+    return composite_pk_eq(fields, value).negate()
+
+
+def composite_pk_in(fields: Sequence[Term], values: Sequence[Sequence[Any]]) -> Criterion:
+    from pypika_tortoise.terms import Tuple as PypikaTuple
+
+    rows = [PypikaTuple(*(ValueWrapper(part) for part in row)) for row in values]
+    return PypikaTuple(*fields).isin(rows)
+
+
+def composite_pk_not_in(fields: Sequence[Term], values: Sequence[Sequence[Any]]) -> Criterion:
+    from pypika_tortoise.terms import Tuple as PypikaTuple
+
+    rows = [PypikaTuple(*(ValueWrapper(part) for part in row)) for row in values]
+    return PypikaTuple(*fields).notin(rows)
+
+
+def get_composite_pk_filters(pk_attrs: Sequence[str]) -> dict[str, FilterInfoDict]:
+    """Filter descriptors for the virtual ``pk`` lookup on composite-PK models."""
+    return {
+        "pk": {
+            "field": pk_attrs[0],
+            "operator": composite_pk_eq,
+            "composite_pk": tuple(pk_attrs),
+        },
+        "pk__not": {
+            "field": pk_attrs[0],
+            "operator": composite_pk_ne,
+            "composite_pk": tuple(pk_attrs),
+        },
+        "pk__in": {
+            "field": pk_attrs[0],
+            "operator": composite_pk_in,
+            "composite_pk": tuple(pk_attrs),
+        },
+        "pk__not_in": {
+            "field": pk_attrs[0],
+            "operator": composite_pk_not_in,
+            "composite_pk": tuple(pk_attrs),
+        },
+    }
 
 
 def get_m2m_filters(field_name: str, field: ManyToManyFieldInstance) -> dict[str, FilterInfoDict]:

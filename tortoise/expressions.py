@@ -391,6 +391,9 @@ class Q:
         else:
             filter_info = model._meta.get_filter(key)
 
+        if composite_attrs := filter_info.get("composite_pk"):
+            return self._process_composite_pk_filter(model, filter_info, value, table), None
+
         field_object = None
         if "table" in filter_info:
             # join the table
@@ -420,6 +423,50 @@ class Q:
         criterion = op(term, value)
         return criterion, join
 
+    def _process_composite_pk_filter(
+        self,
+        model: type[Model],
+        filter_info: FilterInfoDict,
+        value: Any,
+        table: Table,
+    ) -> Criterion:
+        pk_attrs: tuple[str, ...] = filter_info["composite_pk"]
+        op = filter_info["operator"]
+
+        def encode_row(row: Any) -> list[Any]:
+            if hasattr(row, "_meta"):
+                row = tuple(getattr(row, attr) for attr in pk_attrs)
+            if not isinstance(row, (tuple, list)):
+                raise FieldError(
+                    f"Composite primary key filter expects a tuple of {len(pk_attrs)} "
+                    f"values {pk_attrs}, got {row!r}"
+                )
+            if len(row) != len(pk_attrs):
+                raise FieldError(
+                    f"Composite primary key has {len(pk_attrs)} components {pk_attrs}, "
+                    f"got {len(row)} values: {row!r}"
+                )
+            return [
+                model._meta.fields_map[attr].to_db_value(part, model)
+                for attr, part in zip(pk_attrs, row)
+            ]
+
+        terms = [
+            table[model._meta.fields_db_projection.get(attr, attr)] for attr in pk_attrs
+        ]
+
+        if op.__name__ in {"composite_pk_in", "composite_pk_not_in"}:
+            if not isinstance(value, (tuple, list)):
+                raise FieldError(
+                    f"Composite primary key __in filter expects a list/tuple of key tuples, "
+                    f"got {value!r}"
+                )
+            encoded = [encode_row(row) for row in value]
+            return op(terms, encoded)
+
+        encoded = encode_row(value)
+        return op(terms, encoded)
+
     def _resolve_regular_kwarg(
         self, resolve_context: ResolveContext, key: str, value: Any, table: Table
     ) -> QueryModifier:
@@ -438,6 +485,14 @@ class Q:
         self, resolve_context: ResolveContext, key: str, value: Table | FilterInfoDict
     ) -> tuple[str, Any]:
         filter_key = key
+        if (
+            key in ("pk", "pk__not", "pk__in", "pk__not_in")
+            and resolve_context.model._meta.composite_pk
+            and not isinstance(value, (tuple, list))
+            and hasattr(value, "_meta")
+        ):
+            # Allow passing a model instance as a composite key value.
+            value = tuple(getattr(value, attr) for attr in resolve_context.model._meta.pk_attrs)
         if (
             key in resolve_context.model._meta.fk_fields
             or key in resolve_context.model._meta.o2o_fields

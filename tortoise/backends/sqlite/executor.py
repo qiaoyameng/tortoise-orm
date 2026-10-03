@@ -66,6 +66,8 @@ class SqliteExecutor(BaseExecutor):
     async def _process_insert_result(self, instance: Model, results: Any) -> None:
         if isinstance(results, int):
             pk_field_object = self.model._meta.pk
+            if self.model._meta.composite_pk:
+                return
             if (
                 isinstance(pk_field_object, (SmallIntField, IntField, BigIntField))
                 and pk_field_object.generated

@@ -13,6 +13,7 @@ Changelog
 
 Added
 ^^^^^
+- Composite primary keys: declare ``class Meta: primary_key = ("tenant_id", "code")`` to build a model whose natural key spans several columns. The public identity is the ordered ``tortoise.CompositePK`` tuple returned by ``instance.pk``; ``get``/``Model[key]``/``filter(pk=...)``/``in_bulk``/``save``/``delete``/``refresh_from_db`` all bind on the full key, schema generation emits a table-level ``PRIMARY KEY`` constraint, and saving a persisted instance after changing key components raises ``IntegrityError`` instead of updating another row. Relations pointing at a composite key are not supported yet and fail clearly during initialization.
 - ``Q.__bool__()`` so ``Q`` objects with no filters/children (including nested empty ``Q`` children) are falsy. (#2227)
 - PostgreSQL ``password`` credential now accepts a sync or async callable, resolved once per new connection, to support short-lived credentials such as AWS RDS/Aurora IAM tokens and Azure Entra ID tokens. (#2261)
 

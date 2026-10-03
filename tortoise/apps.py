@@ -183,6 +183,14 @@ class Apps:
                         f'field "{to_field}" in model "{related_model_name}" is not unique'
                     )
             else:
+                if related_model._meta.composite_pk:
+                    raise ConfigurationError(
+                        f'Relation "{field}" on model "{model.__name__}" points to model '
+                        f'"{related_model_name}" which has a composite primary key '
+                        f'{related_model._meta.pk_attrs}. Relations targeting composite '
+                        "primary keys are not supported in this version; specify a unique "
+                        "single-column field with to_field=... instead"
+                    )
                 fk_object.to_field = related_model._meta.pk_attr
                 related_field = related_model._meta.pk
             key_fk_object = copy(related_field)
@@ -233,6 +241,9 @@ class Apps:
                 related_model._meta.add_field(backward_relation_name, fk_relation)
             if is_o2o and fk_object.pk:
                 model._meta.pk_attr = key_field
+                model._meta.pk_attrs = (key_field,)
+                model._meta.db_pk_column = key_fk_object.source_field
+                model._meta.db_pk_columns = (key_fk_object.source_field,)
 
         for app_name, app in self.apps.items():
             for model_name, model in app.items():
@@ -269,6 +280,13 @@ class Apps:
                     else:
                         related_app_name, related_model_name = split_reference(reference)
                         related_model = get_related_model(related_app_name, related_model_name)
+
+                    if model._meta.composite_pk or related_model._meta.composite_pk:
+                        raise ConfigurationError(
+                            f'Many-to-many field "{field}" on model "{model.__name__}" uses a '
+                            "model with a composite primary key. Many-to-many relations for "
+                            "composite primary key models are not supported in this version"
+                        )
 
                     m2m_object.related_model = related_model
 

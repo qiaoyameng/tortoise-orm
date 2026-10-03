@@ -21,6 +21,7 @@ from tortoise.exceptions import (
     MultipleObjectsReturned,
     OperationalError,
     ParamsError,
+    UnSupportedError,
 )
 from tortoise.expressions import Expression, Q, RawSQL, ResolveContext, ResolveResult, Value
 from tortoise.fields.base import DatabaseDefault
@@ -938,7 +939,11 @@ class QuerySet(AwaitableQuery[MODEL]):
         :param id_list: A list of field values
         :param field_name: Must be a unique field
         """
+        if field_name == "pk" and self.model._meta.composite_pk:
+            id_list = [tuple(part) for part in id_list]
         objs = await self.filter(**{f"{field_name}__in": id_list})
+        if field_name == "pk" and self.model._meta.composite_pk:
+            return {obj.pk: obj for obj in objs}
         return {getattr(obj, field_name): obj for obj in objs}
 
     def bulk_create(
@@ -997,6 +1002,12 @@ class QuerySet(AwaitableQuery[MODEL]):
 
         :raises ValueError: If objects have no primary key set
         """
+        objects = list(objects)
+        if self.model._meta.composite_pk:
+            raise UnSupportedError(
+                f"bulk_update() is not supported for model {self.model.__name__} with a "
+                f"composite primary key {self.model._meta.pk_attrs} in this version"
+            )
         if any(obj.pk is None for obj in objects):
             raise ValueError("All bulk_update() objects must have a primary key set.")
         return BulkUpdateQuery(
@@ -1555,9 +1566,14 @@ class ContainsQuery(ExistsQuery):
 
     def _make_query(self) -> None:
         super()._make_query()
-        pk_field = Field(self.model._meta.db_pk_column)
-        pk_value = self.model._meta.pk.to_db_value(self._obj.pk, self._obj)
-        self.query = self.query.where(pk_field.eq(pk_value))
+        table = self.model._meta.basetable
+        executor = self._db.executor_class(model=self.model, db=self._db)
+        self.query = executor._apply_pk_filter(self.query, table, start_param=0)
+        self._pk_values = executor._pk_db_values(self._obj)
+
+    async def _execute(self) -> bool:
+        result, _ = await self._db.execute_query(self.query.get_sql(), self._pk_values)
+        return bool(result)
 
 
 class CountQuery(AwaitableQuery):

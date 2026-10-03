@@ -73,7 +73,7 @@ class BaseExecutor:
             table = self.model._meta.basetable
             basequery = cast(QueryBuilder, self.model._meta.basequery)
             self.delete_query = str(
-                basequery.where(table[self.model._meta.db_pk_column] == self.parameter(0)).delete()
+                self._apply_pk_filter(basequery, table, start_param=0).delete()
             )
             self.update_cache: dict[str, str] = {}
 
@@ -213,6 +213,25 @@ class BaseExecutor:
         )
         if ignore_conflicts:
             query = query.on_conflict().do_nothing()
+        return query
+
+    def _pk_columns(self) -> tuple[str, ...]:
+        """DB columns bound by the primary key, in pk declaration order."""
+        return self.model._meta.db_pk_columns
+
+    def _pk_db_values(self, instance: Model) -> list[Any]:
+        """Bind values for the primary key columns, in pk declaration order."""
+        meta = self.model._meta
+        if meta.composite_pk:
+            return meta.get_db_pk_values(instance)
+        return [meta.pk.to_db_value(instance.pk, instance)]
+
+    def _apply_pk_filter(
+        self, query: QueryBuilder, table: Table, start_param: int
+    ) -> QueryBuilder:
+        """Constrain *query* to the row identified by primary key parameters."""
+        for offset, column in enumerate(self._pk_columns()):
+            query = query.where(table[column] == self.parameter(start_param + offset))
         return query
 
     async def _process_insert_result(self, instance: Model, results: Any) -> None:
@@ -387,19 +406,18 @@ class BaseExecutor:
             return
 
         # Need PK to SELECT
-        if instance.pk is None:
+        if not instance._has_pk():
             return
 
         # Build SELECT via pypika for proper quoting
         table = self.model._meta.basetable
-        pk_col = self.model._meta.db_pk_column
         query = (
             self.db.query_class.from_(table)
             .select(*fields_to_fetch)
-            .where(table[pk_col] == self.parameter(0))
         )
-        pk_value = self.model._meta.pk.to_db_value(instance.pk, instance)
-        _, rows = await self.db.execute_query(str(query), [pk_value])
+        query = self._apply_pk_filter(query, table, start_param=0)
+        pk_values = self._pk_db_values(instance)
+        _, rows = await self.db.execute_query(str(query), pk_values)
 
         if rows:
             row = rows[0]
@@ -451,7 +469,7 @@ class BaseExecutor:
                     )
                     query = query.set(db_column, value)
 
-        query = query.where(table[self.model._meta.db_pk_column] == self.parameter(parameter_idx))
+        query = self._apply_pk_filter(query, table, start_param=parameter_idx)
 
         sql = query.get_sql()
         if not expressions:
@@ -500,7 +518,7 @@ class BaseExecutor:
                 field_obj = self.model._meta.fields_map[field]
                 values.append(field_obj.to_db_value(instance_field, instance))
 
-        values.append(self.model._meta.pk.to_db_value(instance.pk, instance))
+        values.extend(self._pk_db_values(instance))
         return (
             await self.db.execute_query(self.get_update_sql(effective_fields, expressions), values)
         )[0]
@@ -508,7 +526,7 @@ class BaseExecutor:
     async def execute_delete(self, instance: type[Model] | Model) -> int:
         return (
             await self.db.execute_query(
-                self.delete_query, [self.model._meta.pk.to_db_value(instance.pk, instance)]
+                self.delete_query, self._pk_db_values(instance)
             )
         )[0]
 

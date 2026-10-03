@@ -125,6 +125,50 @@ Any of these are valid primary key definitions:
     guid = fields.UUIDField(primary_key=True)
 
 
+Composite primary keys
+~~~~~~~~~~~~~~~~~~~~~~
+
+A model can use a natural key spanning several columns by declaring the key
+fields in ``Meta.primary_key`` (at least two, no duplicates, none nullable or
+DB-generated):
+
+.. code-block:: python3
+
+    from tortoise import Model, CompositePK, fields
+
+    class TenantItem(Model):
+        tenant_id = fields.IntField()
+        code = fields.CharField(max_length=40)
+        name = fields.CharField(max_length=100, null=True)
+
+        class Meta:
+            primary_key = ("tenant_id", "code")
+
+No extra ``id`` column is created and the database table gets a composite
+``PRIMARY KEY`` constraint. ``instance.pk`` is an ordered ``CompositePK`` tuple
+(a ``tuple`` subclass) of the component values, and every operation binds on
+the complete key:
+
+.. code-block:: python3
+
+    await TenantItem.create(tenant_id=1, code="x", name="A")
+    await TenantItem.create(tenant_id=2, code="x", name="B")  # same code, different tenant
+
+    obj = await TenantItem.get(pk=CompositePK(1, "x"))   # or: get(pk=(1, "x"))
+    obj = await TenantItem[(1, "x")]
+    found = await TenantItem.filter(pk__in=[(1, "x"), (2, "x")])
+    bulk = await TenantItem.in_bulk([(1, "x"), (2, "x")])
+
+Modifying a primary key component on a persisted instance is rejected on
+``save()`` with ``IntegrityError`` so an update can't silently hit another row;
+use ``clone(pk=(...))`` to persist a new row instead.
+
+.. note::
+   Relations (``ForeignKeyField``, ``OneToOneField``, ``ManyToManyField``)
+   targeting a composite primary key are not supported yet and raise a
+   ``ConfigurationError`` at model initialization.
+
+
 Inheritance
 -----------
 
@@ -220,6 +264,14 @@ The ``Meta`` class
             unique_together=("field_a", "field_b")
             unique_together=(("field_a", "field_b"), )
             unique_together=(("field_a", "field_b"), ("field_c", "field_d", "field_e"))
+
+    .. attribute:: primary_key
+        :annotation: = None
+
+        Declare a composite primary key as a tuple/list of at least two field
+        names, e.g. ``primary_key = ("tenant_id", "code")``. The listed fields
+        must exist, be non-nullable and not be DB-generated. See
+        `Composite primary keys`_ above.
 
     .. attribute:: indexes
         :annotation: = None

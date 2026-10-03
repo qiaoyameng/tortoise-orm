@@ -31,6 +31,7 @@ class BaseSchemaGenerator(SchemaQuotingMixin):
     )
     UNIQUE_INDEX_CREATE_TEMPLATE = INDEX_CREATE_TEMPLATE.replace("INDEX", "UNIQUE INDEX")
     UNIQUE_CONSTRAINT_CREATE_TEMPLATE = 'CONSTRAINT "{index_name}" UNIQUE ({fields})'
+    PRIMARY_KEY_CONSTRAINT_CREATE_TEMPLATE = 'CONSTRAINT "{index_name}" PRIMARY KEY ({fields})'
     GENERATED_PK_TEMPLATE = '"{field_name}" {generated_sql}{comment}'
     FK_TEMPLATE = ' REFERENCES {table} ("{field}") ON DELETE {on_delete}{comment}'
     M2M_TABLE_TEMPLATE = (
@@ -211,6 +212,15 @@ class BaseSchemaGenerator(SchemaQuotingMixin):
             fields=", ".join([self.quote(f) for f in field_names]),
         )
 
+    def _get_primary_key_constraint_sql(
+        self, model: type[Model], field_names: Sequence[str]
+    ) -> str:
+        index_name = self._get_index_name("pk", model, field_names)
+        return self.PRIMARY_KEY_CONSTRAINT_CREATE_TEMPLATE.format(
+            index_name=index_name,
+            fields=", ".join([self.quote(f) for f in field_names]),
+        )
+
     def _get_pk_field_sql_type(self, pk_field: Field) -> str:
         if isinstance(pk_field, OneToOneFieldInstance):
             return self._get_pk_field_sql_type(pk_field.related_model._meta.pk)
@@ -244,6 +254,7 @@ class BaseSchemaGenerator(SchemaQuotingMixin):
         default: str,
         comment: str,
         schema: str | None = None,
+        model: type[Model] | None = None,
     ) -> tuple[str, str]:
         nullable = " NOT NULL" if not field_object.null else ""
         unique = " UNIQUE" if field_object.unique else ""
@@ -284,12 +295,17 @@ class BaseSchemaGenerator(SchemaQuotingMixin):
                     comment=comment,
                 )
         if not field_creation_string:
+            is_composite_pk_component = bool(
+                model
+                and model._meta.composite_pk
+                and field_object.model_field_name in model._meta.pk_attrs
+            )
             field_creation_string = self._create_string(
                 db_column=column_name,
                 field_type=field_type,
                 nullable=nullable,
                 unique=unique,
-                is_primary_key=field_object.pk,
+                is_primary_key=field_object.pk and not is_composite_pk_component,
                 comment=comment,
                 default=default,
             )
@@ -459,6 +475,7 @@ class BaseSchemaGenerator(SchemaQuotingMixin):
                 default,
                 comment,
                 schema=schema,
+                model=model,
             )
             if related_table_name:
                 references.add(related_table_name)
@@ -476,6 +493,11 @@ class BaseSchemaGenerator(SchemaQuotingMixin):
                 fields_to_create.append(
                     self._get_unique_constraint_sql(model, unique_together_to_create)
                 )
+
+        if model._meta.composite_pk:
+            fields_to_create.append(
+                self._get_primary_key_constraint_sql(model, list(model._meta.db_pk_columns))
+            )
 
         field_indexes_sqls = self._get_field_indexes_sqls(model, fields_with_index, safe)
 

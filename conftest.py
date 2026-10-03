@@ -6,6 +6,11 @@ Uses function-scoped fixtures for true test isolation.
 
 import os
 
+# The sandbox seccomp profile blocks send() on socketpair fds, which breaks
+# asyncio's cross-thread self-pipe wakeup (used by aiosqlite's worker thread).
+# Swap the self-pipe for an anonymous os.pipe before any event loop exists.
+from tests.composite_pk._pipe_selfpipe import _make_self_pipe as _patched_make_self_pipe  # noqa: F401,E402
+
 import pytest
 import pytest_asyncio
 

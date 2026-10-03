@@ -24,7 +24,7 @@ from tortoise.fields.relational import (
     OneToOneFieldInstance,
 )
 from tortoise.log import logger
-from tortoise.models import Model, ModelMeta
+from tortoise.models import CompositePK, Model, ModelMeta
 from tortoise.timezone import _reset_timezone_cache
 from tortoise.utils import generate_schema_for_client
 
@@ -574,6 +574,7 @@ __version__ = "1.1.8"
 __all__ = [
     "BackwardFKRelation",
     "BackwardOneToOneRelation",
+    "CompositePK",
     "Model",
     "ForeignKeyFieldInstance",
     "ManyToManyFieldInstance",
