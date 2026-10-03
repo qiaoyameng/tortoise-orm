@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pypika_tortoise import JoinType, Parameter, Table
 from pypika_tortoise.queries import QueryBuilder
+from pypika_tortoise.terms import PseudoColumn
 
 from tortoise.exceptions import OperationalError, UnSupportedError
 from tortoise.expressions import Expression, ResolveContext
@@ -413,15 +414,17 @@ class BaseExecutor:
         self,
         update_fields: Iterable[str] | None,
         expressions: dict[str, Expression] | None,
+        database_defaults: set[str] | None = None,
     ) -> str:
         """
         Generates the SQL for updating a model depending on provided update_fields.
         Result is cached for performance.
         """
         key = ",".join(update_fields) if update_fields else ""
-        if not expressions and key in self.update_cache:
-            return self.update_cache[key]
         expressions = expressions or {}
+        database_defaults = database_defaults or set()
+        if not expressions and not database_defaults and key in self.update_cache:
+            return self.update_cache[key]
         table = self.model._meta.basetable
         query = self.db.query_class.update(table)
         parameter_idx = 0
@@ -433,7 +436,9 @@ class BaseExecutor:
                     raise OperationalError(f"Can't update generated field {field}")
                 continue
             if not field_object.pk:
-                if field not in expressions.keys():
+                if field in database_defaults:
+                    query = query.set(db_column, PseudoColumn("DEFAULT"))
+                elif field not in expressions.keys():
                     query = query.set(db_column, self.parameter(parameter_idx))
                     parameter_idx += 1
                 else:
@@ -454,12 +459,15 @@ class BaseExecutor:
         query = query.where(table[self.model._meta.db_pk_column] == self.parameter(parameter_idx))
 
         sql = query.get_sql()
-        if not expressions:
+        if not expressions and not database_defaults:
             self.update_cache[key] = sql
         return sql
 
     async def execute_update(
-        self, instance: type[Model] | Model, update_fields: Iterable[str] | None
+        self,
+        instance: type[Model] | Model,
+        update_fields: Iterable[str] | None,
+        apply_database_defaults: bool = False,
     ) -> int:
 
         user_specified = update_fields is not None
@@ -470,6 +478,7 @@ class BaseExecutor:
         )
 
         effective_fields: list[str] = []
+        database_default_fields: set[str] = set()
         for field in source_fields:
             field_obj = self.model._meta.fields_map[field]
             if field_obj.pk:
@@ -484,6 +493,9 @@ class BaseExecutor:
                 continue
             instance_field = getattr(instance, field)
             if isinstance(instance_field, DatabaseDefault):
+                if apply_database_defaults:
+                    effective_fields.append(field)
+                    database_default_fields.add(field)
                 continue
             effective_fields.append(field)
 
@@ -494,6 +506,8 @@ class BaseExecutor:
         expressions = {}
         for field in effective_fields:
             instance_field = getattr(instance, field)
+            if field in database_default_fields:
+                continue
             if isinstance(instance_field, Expression):
                 expressions[field] = instance_field
             else:
@@ -502,7 +516,14 @@ class BaseExecutor:
 
         values.append(self.model._meta.pk.to_db_value(instance.pk, instance))
         return (
-            await self.db.execute_query(self.get_update_sql(effective_fields, expressions), values)
+            await self.db.execute_query(
+                self.get_update_sql(
+                    effective_fields,
+                    expressions,
+                    database_default_fields,
+                ),
+                values,
+            )
         )[0]
 
     async def execute_delete(self, instance: type[Model] | Model) -> int:

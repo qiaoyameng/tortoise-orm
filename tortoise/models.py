@@ -26,7 +26,7 @@ from tortoise.exceptions import (
     ValidationError,
 )
 from tortoise.expressions import Expression
-from tortoise.fields.base import Field
+from tortoise.fields.base import DatabaseDefault, Field
 from tortoise.fields.data import IntField
 from tortoise.fields.relational import (
     BackwardFKRelation,
@@ -746,6 +746,8 @@ class Model(metaclass=ModelMeta):
         self._saved_in_db = False
         self._custom_generated_pk = False
         self._await_when_save: dict[str, Callable[[], Awaitable[Any]]] = {}
+        self._field_baseline: dict[str, Any] = {}
+        self._field_unknown: set[str] = set()
 
         # Assign defaults for missing fields
         for key in meta.fields.difference(self._set_kwargs(kwargs)):
@@ -767,13 +769,112 @@ class Model(metaclass=ModelMeta):
                 else:
                     setattr(self, key, None)
 
+        self._init_field_baseline()
+
     def __setattr__(self, key, value) -> None:
         # set field value override async default function
         if hasattr(self, "_await_when_save"):
             self._await_when_save.pop(key, None)
         if key in self._meta.fk_fields or key in self._meta.o2o_fields:
             self._validate_relation_type(key, value)
+        was_unknown = (
+            key in self._meta.fields_db_projection
+            and hasattr(self, "_field_unknown")
+            and key in self._field_unknown
+        )
+        if key in self._meta.fields_db_projection and hasattr(self, "_field_unknown"):
+            self._field_unknown.discard(key)
         super().__setattr__(key, value)
+        if key in self._meta.fields_db_projection and hasattr(self, "_field_baseline"):
+            if isinstance(value, (Expression, DatabaseDefault)):
+                self._field_unknown.add(key)
+            elif was_unknown and key not in self._field_baseline:
+                self._field_unknown.add(key)
+
+    @staticmethod
+    def _snapshot_field_value(value: Any) -> Any:
+        if isinstance(value, (Expression, DatabaseDefault)):
+            return value
+        try:
+            return deepcopy(value)
+        except TypeError:
+            return value
+
+    def _init_field_baseline(self) -> None:
+        baseline: dict[str, Any] = {}
+        unknown: set[str] = set()
+        for field_name in self._meta.fields_db_projection:
+            if not hasattr(self, field_name):
+                continue
+            value = object.__getattribute__(self, field_name)
+            if isinstance(value, (Expression, DatabaseDefault)):
+                unknown.add(field_name)
+                continue
+            baseline[field_name] = self._snapshot_field_value(value)
+        object.__setattr__(self, "_field_baseline", baseline)
+        object.__setattr__(self, "_field_unknown", unknown)
+
+    def _snapshot_dirty_baseline(self) -> tuple[dict[str, Any], set[str]]:
+        return {
+            field_name: self._snapshot_field_value(value)
+            for field_name, value in self._field_baseline.items()
+        }, set(self._field_unknown)
+
+    def _restore_dirty_baseline(self, baseline: dict[str, Any], unknown: set[str]) -> None:
+        object.__setattr__(self, "_field_baseline", baseline)
+        object.__setattr__(self, "_field_unknown", unknown)
+
+    def _mark_fields_known(
+        self,
+        fields: Iterable[str],
+        *,
+        written_database_defaults: Iterable[str] = (),
+    ) -> None:
+        written_database_defaults = set(written_database_defaults)
+        for field_name in fields:
+            value = getattr(self, field_name, None)
+            if isinstance(value, DatabaseDefault):
+                if field_name not in written_database_defaults:
+                    continue
+            if isinstance(value, (Expression, DatabaseDefault)):
+                self._field_baseline[field_name] = self._snapshot_field_value(value)
+                self._field_unknown.discard(field_name)
+            else:
+                self._field_baseline[field_name] = self._snapshot_field_value(value)
+                self._field_unknown.discard(field_name)
+
+    def _get_dirty_fields(self) -> list[str]:
+        dirty_fields = set(self._field_unknown)
+        for field_name, baseline in self._field_baseline.items():
+            field_object = self._meta.fields_map[field_name]
+            if field_object.pk or field_object.generated:
+                continue
+            value = getattr(self, field_name)
+            if value != baseline:
+                dirty_fields.add(field_name)
+        return [
+            field_name
+            for field_name in self._meta.fields_db_projection
+            if field_name in dirty_fields
+        ]
+
+    def get_dirty_fields(self) -> list[str]:
+        """
+        Return loaded model fields whose local Python value differs from the
+        value captured when the instance was loaded or last successfully saved.
+
+        Fields not loaded by a ``.only()`` query are excluded. Assigning a new
+        value and then assigning the original value back makes the field clean.
+        Mutable values are compared against a deep-copied baseline, so in-place
+        modifications (for example ``obj.data["key"] = value``) are detected.
+
+        Fields holding an :class:`~tortoise.expressions.Expression` or
+        :class:`~tortoise.fields.base.DatabaseDefault` are reported as dirty.
+        A successful write advances their baseline to that submitted object,
+        so reissuing the unchanged expression does not cause another UPDATE.
+        Call ``refresh_from_db`` when the resulting Python value is needed.
+        """
+        return self._get_dirty_fields()
 
     def _set_kwargs(self, kwargs: dict) -> set[str]:
         meta = self._meta
@@ -824,6 +925,8 @@ class Model(metaclass=ModelMeta):
         self._saved_in_db = True
         self._custom_generated_pk = self._meta.db_pk_column not in self._meta.generated_db_fields
         self._await_when_save = {}
+        self._field_baseline = {}
+        self._field_unknown = set()
 
         meta = self._meta
         _setattr = object.__setattr__  # bypass __setattr__ override for performance
@@ -860,6 +963,8 @@ class Model(metaclass=ModelMeta):
                         value = field.to_python_value(value)
                 model_field = meta.fields_db_projection_reverse.get(key, key)
                 _setattr(self, model_field, value)
+
+        self._init_field_baseline()
 
         return self
 
@@ -944,6 +1049,7 @@ class Model(metaclass=ModelMeta):
         else:
             obj.pk = pk
         obj._saved_in_db = False
+        obj._init_field_baseline()
         return obj
 
     @classmethod
@@ -995,6 +1101,8 @@ class Model(metaclass=ModelMeta):
         _setattr(self, "_saved_in_db", _saved_in_db)
         _setattr(self, "_custom_generated_pk", False)
         _setattr(self, "_await_when_save", {})
+        _setattr(self, "_field_baseline", {})
+        _setattr(self, "_field_unknown", set())
 
         # Track source fields that are auto-populated from FK/O2O objects
         # so that the default-setting loop doesn't overwrite them with None.
@@ -1059,6 +1167,7 @@ class Model(metaclass=ModelMeta):
             else:
                 _setattr(self, key, None)
 
+        self._init_field_baseline()
         return self
 
     def update_from_dict(self: MODEL, data: dict) -> MODEL:
@@ -1169,30 +1278,161 @@ class Model(metaclass=ModelMeta):
                     f"{self.__class__.__name__} is a partial model, can only be saved with the relevant update_field provided"
                 )
         await self._pre_save(db, update_fields)
+        baseline = self._snapshot_dirty_baseline()
 
-        if force_create:
-            await executor.execute_insert(self)
-            created = True
-        elif force_update:
-            rows = await executor.execute_update(self, update_fields)
-            if rows == 0:
-                raise IntegrityError(f"Can't update object that doesn't exist. PK: {self.pk}")
-            created = False
-        else:
-            if self._saved_in_db or update_fields:
-                if self.pk is None:
-                    await executor.execute_insert(self)
-                    created = True
-                else:
-                    await executor.execute_update(self, update_fields)
-                    created = False
-            else:
-                # TODO: Do a merge/upsert operation here instead. Let the executor determine an optimal strategy for each DB engine.
+        try:
+            if force_create:
                 await executor.execute_insert(self)
+                rows = 1
                 created = True
+            elif force_update:
+                rows = await executor.execute_update(self, update_fields)
+                if rows == 0:
+                    raise IntegrityError(f"Can't update object that doesn't exist. PK: {self.pk}")
+                created = False
+            else:
+                if self._saved_in_db or update_fields:
+                    if self.pk is None:
+                        await executor.execute_insert(self)
+                        rows = 1
+                        created = True
+                    else:
+                        rows = await executor.execute_update(self, update_fields)
+                        created = False
+                else:
+                    # TODO: Do a merge/upsert operation here instead. Let the executor determine an optimal strategy for each DB engine.
+                    await executor.execute_insert(self)
+                    rows = 1
+                    created = True
+        except BaseException:
+            self._restore_dirty_baseline(*baseline)
+            raise
+
+        if rows > 0:
+            if created:
+                self._mark_fields_known(
+                    self._meta.fields_db_projection,
+                    written_database_defaults=self._meta.fields_db_projection,
+                )
+            elif update_fields:
+                self._mark_fields_known(
+                    field_name
+                    for field_name in update_fields
+                    if not self._meta.fields_map[field_name].generated
+                )
+            else:
+                self._mark_fields_known(
+                    field_name
+                    for field_name in self._meta.fields_db_projection
+                    if not self._meta.fields_map[field_name].generated
+                )
 
         self._saved_in_db = True
         await self._post_save(db, created, update_fields)
+
+    async def save_dirty(
+        self,
+        using_db: BaseDBAsyncClient | None = None,
+    ) -> int:
+        """
+        Update only loaded fields that are dirty on an existing record.
+
+        If no loaded field differs from its baseline, no UPDATE is executed and
+        zero is returned. A regular :meth:`save` is not issued for unsaved
+        instances; call :meth:`save` first to create the record.
+
+        Assigning a field back to its original value excludes it from the
+        UPDATE. ``.only()`` fields that were not loaded are never considered.
+        In-place mutable changes (including JSON values) are dirty because the
+        baseline is deep-copied.
+
+        ``auto_now`` fields are included automatically when another field is
+        updated. Python ``default`` values do not make a field dirty. Fields
+        assigned an expression or
+        :class:`~tortoise.fields.base.DatabaseDefault` are updated and then
+        baselined to the submitted expression or default sentinel, but
+        ``refresh_from_db`` is required to obtain their resulting Python
+        value. Database defaults emit ``SET column = DEFAULT``.
+
+        The baseline is advanced only after the UPDATE succeeds. An exception
+        or cancellation leaves the pending changes dirty.
+        """
+        if not self._saved_in_db:
+            raise OperationalError("Can't save_dirty unpersisted record")
+        if self.pk is None:
+            raise IncompleteInstanceError(
+                f"{self.__class__.__name__} is a partial model without primary key fetchd. "
+                "Dirty update not available"
+            )
+        if self._partial:
+            if not hasattr(self, self._meta.pk_attr):
+                raise IncompleteInstanceError(
+                    f"{self.__class__.__name__} is a partial model without primary key fetchd. "
+                    "Dirty update not available"
+                )
+
+        dirty_fields = self._get_dirty_fields()
+        update_fields: list[str] = []
+        for field_name in dirty_fields:
+            field_object = self._meta.fields_map[field_name]
+            if field_object.pk or field_object.generated:
+                continue
+            if self._partial and not hasattr(self, field_name):
+                continue
+            update_fields.append(field_name)
+
+        if not update_fields:
+            return 0
+
+        selected_fields = set(update_fields)
+        for field_name in self._meta.fields_db_projection:
+            field_object = self._meta.fields_map[field_name]
+            if (
+                getattr(field_object, "auto_now", False)
+                and field_name not in selected_fields
+                and (not self._partial or hasattr(self, field_name))
+            ):
+                update_fields.append(field_name)
+
+        await self._set_async_default_field()
+        db = using_db or self._choose_db(True)
+        executor = db.executor_class(model=self.__class__, db=db)
+        written_database_defaults = {
+            field_name
+            for field_name in update_fields
+            if isinstance(getattr(self, field_name, None), DatabaseDefault)
+        }
+        await self._pre_save(db, update_fields)
+        baseline = self._snapshot_dirty_baseline()
+        auto_now_values = {
+            field_name: getattr(self, field_name)
+            for field_name in update_fields
+            if field_name not in selected_fields
+        }
+
+        def restore_pending_state() -> None:
+            for field_name, value in auto_now_values.items():
+                setattr(self, field_name, value)
+            self._restore_dirty_baseline(*baseline)
+
+        try:
+            rows = await executor.execute_update(
+                self, update_fields, apply_database_defaults=True
+            )
+        except BaseException:
+            restore_pending_state()
+            raise
+
+        if rows == 0:
+            restore_pending_state()
+            return 0
+
+        self._mark_fields_known(
+            update_fields,
+            written_database_defaults=written_database_defaults,
+        )
+        await self._post_save(db, False, update_fields)
+        return rows
 
     async def delete(self, using_db: BaseDBAsyncClient | None = None) -> None:
         """
@@ -1249,8 +1489,10 @@ class Model(metaclass=ModelMeta):
             qs = qs.only(*fields)
         obj = await qs.get(pk=self.pk)
 
-        for field in fields or self._meta.db_fields:
+        refreshed_fields = fields or self._meta.db_fields
+        for field in refreshed_fields:
             setattr(self, field, getattr(obj, field, None))
+        self._mark_fields_known(refreshed_fields)
 
     @classmethod
     def _choose_db(cls, for_write: bool = False) -> BaseDBAsyncClient:

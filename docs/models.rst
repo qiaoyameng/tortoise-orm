@@ -465,6 +465,46 @@ Sync usage requires that you call `fetch_related` before the time, and then you 
 
 The reverse lookup of ``team.event_team`` works exactly the same way.
 
+Saving changed fields
+---------------------
+
+Use ``save_dirty()`` after loading an existing model to issue an UPDATE containing only
+the loaded fields that changed:
+
+.. code-block:: python3
+
+    event = await Event.get(id=1)
+    event.name = "New name"
+    await event.save_dirty()
+    # UPDATE ... SET "name"=?, "modified"=? WHERE ...
+
+The instance keeps a deep-copied baseline of the fields selected from the database.
+Changing a field and then assigning the original value back makes it clean. Mutable values,
+including JSON fields, are also tracked by baseline comparison, so in-place changes are
+included:
+
+.. code-block:: python3
+
+    obj = await JSONModel.get(id=1)
+    obj.data["answer"] = 42
+    await obj.save_dirty()
+
+Fields omitted by ``only()`` have no baseline and are not updated. Load such a field first
+or refresh the instance if it must participate in the dirty update. If nothing is dirty,
+``save_dirty()`` returns ``0`` and does not execute an UPDATE.
+
+Python-level ``default`` values simply initialize local values and do not make a field dirty.
+``auto_now`` fields are added automatically when another loaded field is dirty, while
+``auto_now_add`` is not rewritten on later updates. A field assigned an expression, such as
+``F("balance") + 1``, is included in the UPDATE and then baselined to that expression; call
+``refresh_from_db()`` when the resulting scalar value is needed. Assigning
+``DatabaseDefault`` emits ``SET column = DEFAULT`` and baselines the sentinel; refresh the
+field to obtain the database-generated value.
+
+Baselines are advanced only after the database write succeeds. A failed or cancelled UPDATE
+leaves all pending changes dirty, allowing the same instance to be retried unchanged. The
+regular ``save()`` behavior is unchanged and still saves its normal field set.
+
 Improving relational type hinting
 =================================
 
