@@ -1,9 +1,12 @@
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel
+from pypika_tortoise import Table
 
 from tests import testmodels
+from tortoise.backends.base.client import Capabilities
 from tortoise.contrib.test import requireCapability
 from tortoise.contrib.test.condition import In
 from tortoise.exceptions import (
@@ -11,7 +14,9 @@ from tortoise.exceptions import (
     DoesNotExist,
     FieldError,
     IntegrityError,
+    UnSupportedError,
 )
+from tortoise.expressions import JSONRemove, JSONSet, ResolveContext
 from tortoise.fields import JSONField
 from tortoise.indexes import Index
 
@@ -365,3 +370,161 @@ async def test_validate_list(db):
     obj0 = await testmodels.JSONFields.create(data=[], data_validate=["text", 3])
     obj = await testmodels.JSONFields.get(id=obj0.id)
     assert obj.data_validate == ["text", 3]
+
+
+@pytest.mark.asyncio
+async def test_json_set_queryset_nested_paths_and_types(db):
+    obj = await testmodels.JSONFields.create(data={"profile": {"name": "Ada"}, "items": [1]})
+
+    await testmodels.JSONFields.filter(pk=obj.pk).update(
+        data=JSONSet("data", ("profile", "a.b", 'quote."'), True)
+    )
+    await testmodels.JSONFields.filter(pk=obj.pk).update(
+        data=JSONSet("data", ("items", 1), {"ok": False})
+    )
+    await testmodels.JSONFields.filter(pk=obj.pk).update(
+        data=JSONSet("data", ("values",), None)
+    )
+
+    refreshed = await testmodels.JSONFields.get(pk=obj.pk)
+    assert refreshed.data == {
+        "profile": {"name": "Ada", "a": {"b": {"quote.\"": True}}},
+        "items": [1, {"ok": False}],
+        "values": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_json_set_save_nested_paths_and_types(db):
+    obj = await testmodels.JSONFields.create(data={"profile": {}})
+    obj.data = JSONSet("data", ("profile", "score"), 1.5)
+    await obj.save(update_fields=["data"])
+
+    refreshed = await testmodels.JSONFields.get(pk=obj.pk)
+    assert refreshed.data == {"profile": {"score": 1.5}}
+
+
+@pytest.mark.asyncio
+async def test_json_two_updates_keep_both_changes(db):
+    obj = await testmodels.JSONFields.create(data={"shared": {"first": 0, "second": 0}})
+
+    await testmodels.JSONFields.filter(pk=obj.pk).update(
+        data=JSONSet("data", ("shared", "first"), 1)
+    )
+    await testmodels.JSONFields.filter(pk=obj.pk).update(
+        data=JSONSet("data", ("shared", "second"), 2)
+    )
+
+    refreshed = await testmodels.JSONFields.get(pk=obj.pk)
+    assert refreshed.data == {"shared": {"first": 1, "second": 2}}
+
+
+@pytest.mark.asyncio
+async def test_json_set_remove_ordered_multiple_operations(db):
+    obj = await testmodels.JSONFields.create(data={"a": 1, "b": 2, "items": [10, 20]})
+    expression = JSONRemove(
+        JSONSet(
+            "data",
+            [
+                (("c",), 3),
+                (("d",), 4),
+                (("c",), 5),
+                (("e",), 6),
+            ],
+        ),
+        ("a",),
+        ("b",),
+        ("e",),
+        ("items",),
+    )
+
+    await testmodels.JSONFields.filter(pk=obj.pk).update(data=expression)
+
+    refreshed = await testmodels.JSONFields.get(pk=obj.pk)
+    assert refreshed.data == {"c": 5, "d": 4}
+
+
+@pytest.mark.asyncio
+async def test_json_set_and_remove_boundary_behavior(db):
+    await testmodels.JSONFields.create(id=1, data={"parent": [1]})
+    await testmodels.JSONFields.create(id=2, data={})
+    await testmodels.JSONFields.create(id=3, data_null=None)
+
+    await testmodels.JSONFields.filter(pk=1).update(
+        data=JSONSet("data", ("parent", 3), "ignored")
+    )
+    await testmodels.JSONFields.filter(pk=2).update(
+        data=JSONSet("data", ("missing", "child", 0), "created")
+    )
+    await testmodels.JSONFields.filter(pk=2).update(
+        data=JSONRemove("data", ("missing", "other"))
+    )
+    await testmodels.JSONFields.filter(pk=3).update(
+        data=JSONSet("data_null", ("a",), True)
+    )
+    await testmodels.JSONFields.filter(pk=3).update(
+        data=JSONRemove("data_null", ("a",))
+    )
+
+    assert (await testmodels.JSONFields.get(pk=1)).data == {"parent": [1]}
+    assert (await testmodels.JSONFields.get(pk=2)).data == {
+        "missing": {"child": ["created"]}
+    }
+    assert (await testmodels.JSONFields.get(pk=3)).data_null is None
+
+
+@pytest.mark.asyncio
+async def test_json_structured_paths_are_bound_parameters(db):
+    malicious_key = "a'), (SELECT 1); --"
+    obj = await testmodels.JSONFields.create(data={})
+    queryset = testmodels.JSONFields.filter(pk=obj.pk).update(
+        data=JSONSet("data", (malicious_key,), "safe")
+    )
+
+    sql = queryset.sql()
+    assert malicious_key not in sql
+    assert sql.count("?") == 4
+    await queryset
+
+    refreshed = await testmodels.JSONFields.get(pk=obj.pk)
+    assert refreshed.data == {malicious_key: "safe"}
+
+
+def test_json_set_rejects_invalid_path():
+    with pytest.raises(FieldError, match="sequences"):
+        JSONSet("data", "not.a.path", 1)
+    with pytest.raises(FieldError, match="non-negative"):
+        JSONSet("data", (-1,), 1)
+    with pytest.raises(FieldError, match="at least one"):
+        JSONRemove("data", ())
+
+
+def test_json_set_reports_unsupported_backend():
+    field = JSONField()
+    model = type(
+        "JSONModel",
+        (),
+        {
+            "__name__": "JSONModel",
+            "_meta": SimpleNamespace(
+                fields_map={"data": field},
+                fields_db_projection={"data": "data"},
+                db=SimpleNamespace(
+                    capabilities=Capabilities(
+                        "postgres",
+                        support_json_path_update=False,
+                    )
+                ),
+            ),
+        },
+    )
+
+    with pytest.raises(UnSupportedError, match="postgres does not support JSON path"):
+        JSONSet("data", ("a",), 1).resolve(
+            ResolveContext(
+                model=model,
+                table=Table("json_model"),
+                annotations={},
+                custom_filters={},
+            )
+        )

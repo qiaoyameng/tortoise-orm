@@ -62,6 +62,7 @@ class Capabilities:
     :param support_update_limit_order_by: support update/delete with limit and order by.
     :param support_for_posix_regex_queries: indicated if the db supports posix regex queries
     :param support_json_attributes: indicated if the db supports accessing json attributes
+    :param support_json_path_update: indicates if the db supports native JSON path updates
     :param can_rollback_ddl: Whether the database supports transactional DDL.
         Used to determine if migrations can be run atomically.
     :param support_returning: Indicates that this DB supports INSERT ... RETURNING.
@@ -85,6 +86,7 @@ class Capabilities:
         support_update_limit_order_by: bool = True,
         support_for_posix_regex_queries: bool = False,
         support_json_attributes: bool = False,
+        support_json_path_update: bool = False,
         can_rollback_ddl: bool = False,
         support_returning: bool = False,
     ) -> None:
@@ -101,6 +103,7 @@ class Capabilities:
         self.support_update_limit_order_by = support_update_limit_order_by
         self.support_for_posix_regex_queries = support_for_posix_regex_queries
         self.support_json_attributes = support_json_attributes
+        self.support_json_path_update = support_json_path_update
         self.can_rollback_ddl = can_rollback_ddl
         self.support_returning = support_returning
         super().__setattr__("_mutable", False)

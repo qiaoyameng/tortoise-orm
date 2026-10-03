@@ -11,7 +11,12 @@ from pypika_tortoise import JoinType, Parameter, Table
 from pypika_tortoise.queries import QueryBuilder
 
 from tortoise.exceptions import OperationalError, UnSupportedError
-from tortoise.expressions import Expression, ResolveContext
+from tortoise.expressions import (
+    Expression,
+    JSONPathExpression,
+    ResolveContext,
+    _get_json_bind_values,
+)
 from tortoise.fields.base import DatabaseDefault
 from tortoise.fields.relational import (
     BackwardFKRelation,
@@ -437,18 +442,30 @@ class BaseExecutor:
                     query = query.set(db_column, self.parameter(parameter_idx))
                     parameter_idx += 1
                 else:
-                    value = (
-                        expressions[field]
-                        .resolve(
+                    if isinstance(expressions[field], JSONPathExpression):
+                        value = expressions[field].resolve(
                             ResolveContext(
                                 model=self.model,
                                 table=table,
                                 annotations={},
                                 custom_filters={},
+                            ),
+                            parameter_idx + 1,
+                        ).term
+                        parameter_idx += expressions[field].bind_count
+                    else:
+                        value = (
+                            expressions[field]
+                            .resolve(
+                                ResolveContext(
+                                    model=self.model,
+                                    table=table,
+                                    annotations={},
+                                    custom_filters={},
+                                )
                             )
+                            .term
                         )
-                        .term
-                    )
                     query = query.set(db_column, value)
 
         query = query.where(table[self.model._meta.db_pk_column] == self.parameter(parameter_idx))
@@ -496,6 +513,16 @@ class BaseExecutor:
             instance_field = getattr(instance, field)
             if isinstance(instance_field, Expression):
                 expressions[field] = instance_field
+                if isinstance(instance_field, JSONPathExpression):
+                    resolved = instance_field.resolve(
+                        ResolveContext(
+                            model=self.model,
+                            table=self.model._meta.basetable,
+                            annotations={},
+                            custom_filters={},
+                        )
+                    )
+                    values.extend(_get_json_bind_values(resolved.term))
             else:
                 field_obj = self.model._meta.fields_map[field]
                 values.append(field_obj.to_db_value(instance_field, instance))

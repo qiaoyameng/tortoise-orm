@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import operator
+from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from enum import Enum
@@ -8,7 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pypika_tortoise import Case as PypikaCase
 from pypika_tortoise import Field as PypikaField
-from pypika_tortoise import SqlContext, Table
+from pypika_tortoise import Parameter, SqlContext, Table
 from pypika_tortoise.functions import AggregateFunction, DistinctOptionFunction
 from pypika_tortoise.terms import (
     ArithmeticExpression,
@@ -19,7 +21,7 @@ from pypika_tortoise.terms import (
 from pypika_tortoise.terms import Function as PypikaFunction
 from pypika_tortoise.utils import format_alias_sql
 
-from tortoise.exceptions import FieldError, OperationalError
+from tortoise.exceptions import FieldError, OperationalError, UnSupportedError
 from tortoise.fields.base import Field
 from tortoise.fields.data import JSONField
 from tortoise.fields.relational import RelationalField
@@ -73,6 +75,275 @@ class Value(Expression):
 
     def resolve(self, resolve_context: ResolveContext) -> ResolveResult:
         return ResolveResult(term=ValueWrapper(self.value))
+
+
+JSONPathPart = str | int
+JSONPath = Sequence[JSONPathPart]
+
+
+class _Unset:
+    pass
+
+
+_UNSET = _Unset()
+
+
+class _JSONBoundValue(Term):
+    def __init__(self, value: Any) -> None:
+        super().__init__()
+        self.value = value
+        self.parameter_offset: int | None = None
+
+    def get_sql(self, ctx: SqlContext) -> str:
+        if self.parameter_offset is None:
+            if ctx.parameterizer is None:
+                return ValueWrapper(self.value, allow_parametrize=False).get_sql(ctx)
+            return ValueWrapper(self.value).get_sql(ctx)
+        return Parameter(idx=self.parameter_offset).get_sql(ctx)
+
+
+class _SQLiteJSONFunction(PypikaFunction):
+    def __init__(
+        self,
+        name: str,
+        document: Term,
+        operations: Sequence[tuple[_JSONBoundValue, Term | None]],
+    ) -> None:
+        args: list[Term] = [document]
+        for path, value in operations:
+            args.append(path)
+            if value is not None:
+                args.append(value)
+        super().__init__(name, *args)
+
+
+def _get_json_bind_values(term: Term) -> list[Any]:
+    return [node.value for node in term.nodes_() if isinstance(node, _JSONBoundValue)]
+
+
+class JSONPathExpression(Expression):
+    bind_count: int
+
+    @staticmethod
+    def _check_capability(resolve_context: ResolveContext) -> None:
+        if not resolve_context.model._meta.db.capabilities.support_json_path_update:
+            dialect = resolve_context.model._meta.db.capabilities.dialect
+            raise UnSupportedError(f"{dialect} does not support JSON path update expressions")
+
+    def _field_object(self, resolve_context: ResolveContext) -> JSONField:
+        field: str | F | JSONPathExpression = self.field
+        while isinstance(field, JSONPathExpression):
+            field = field.field
+        _term, field_object = self._resolve_field(resolve_context, field)
+        return field_object
+
+    def _resolve_field(
+        self, resolve_context: ResolveContext, field: str | F
+    ) -> tuple[PypikaField, JSONField]:
+        if isinstance(field, F):
+            field_name, separator, _json_path = field.name.partition("__")
+            if separator:
+                raise FieldError("JSON update expressions require the JSON field itself")
+        elif isinstance(field, str):
+            field_name = field
+        else:
+            raise FieldError("JSON update expressions require a JSON field name or F()")
+
+        try:
+            field_object = cast(Field, resolve_context.model._meta.fields_map[field_name])
+            db_column = resolve_context.model._meta.fields_db_projection[field_name]
+        except (KeyError, TypeError):
+            raise FieldError(
+                f"There is no non-virtual field {field_name} on Model "
+                f"{resolve_context.model.__name__}"
+            ) from None
+
+        if not isinstance(field_object, JSONField):
+            raise FieldError(f"Field {field_name} is not a JSONField")
+
+        return PypikaField(db_column), field_object
+
+    @staticmethod
+    def _normalize_path(path: JSONPath) -> tuple[JSONPathPart, ...]:
+        if not isinstance(path, Sequence) or isinstance(path, (str, bytes)):
+            raise FieldError("JSON paths must be sequences of strings and non-negative integers")
+
+        normalized: list[JSONPathPart] = []
+        for part in path:
+            if isinstance(part, bool) or not isinstance(part, (str, int)):
+                raise FieldError("JSON path parts must be strings or non-negative integers")
+            if isinstance(part, int) and part < 0:
+                raise FieldError("JSON array indexes must be non-negative")
+            normalized.append(part)
+        normalized_path = tuple(normalized)
+        if not normalized_path:
+            raise FieldError("JSON path must contain at least one part")
+        return normalized_path
+
+    @staticmethod
+    def _encode_path(path: tuple[JSONPathPart, ...]) -> str:
+        encoded = "$"
+        for part in path:
+            if isinstance(part, int):
+                encoded += f"[{part}]"
+            else:
+                encoded += "." + json.dumps(part, ensure_ascii=False)
+        return encoded
+
+    @staticmethod
+    def _serialize_value(field_object: JSONField, value: Any) -> str:
+        try:
+            serialized = (
+                field_object.encoder(value)
+                if isinstance(value, str)
+                else field_object.to_db_value(value, None)
+            )
+        except FieldError:
+            raise
+        except Exception as exc:
+            raise FieldError(f"Value {value!r} is not a valid JSON value") from exc
+
+        if serialized is None:
+            return "null"
+        if isinstance(serialized, bytes):
+            serialized = serialized.decode()
+        if not isinstance(serialized, str):
+            raise FieldError(f"Value {value!r} is not a valid JSON value")
+        return serialized
+
+    def _resolve_document(
+        self, resolve_context: ResolveContext, parameter_offset: int | None
+    ) -> tuple[Term, int]:
+        if isinstance(self.field, JSONPathExpression):
+            if parameter_offset is None:
+                result = self.field.resolve(resolve_context)
+            else:
+                result = self.field.resolve(resolve_context, parameter_offset)
+            return result.term, self.field.bind_count
+
+        term, _field_object = self._resolve_field(resolve_context, self.field)
+        return term, 0
+
+
+class JSONSet(JSONPathExpression):
+    """
+    Update one JSON path without replacing the complete JSON field.
+
+    SQLite creates missing object and array parents. Array indexes outside the existing array
+    are ignored. SQL NULL in the target field is returned unchanged.
+
+    The path is structured and every path part and the JSON value are sent as bind parameters.
+    """
+
+    def __init__(
+        self,
+        field: str | F | JSONPathExpression,
+        path: JSONPath | Sequence[tuple[JSONPath, Any]],
+        value: Any = _UNSET,
+    ) -> None:
+        self.field = field
+        inner_bind_count = (
+            self.field.bind_count if isinstance(self.field, JSONPathExpression) else 0
+        )
+        if isinstance(value, _Unset):
+            if not isinstance(path, Sequence) or isinstance(path, (str, bytes)):
+                raise FieldError("JSON set operations must be (path, value) sequences")
+            path_operations = cast(Sequence[tuple[JSONPath, Any]], path)
+            operations = []
+            for operation in path_operations:
+                if (
+                    not isinstance(operation, Sequence)
+                    or isinstance(operation, (str, bytes))
+                    or len(operation) != 2
+                ):
+                    raise FieldError("JSON set operations must be (path, value) sequences")
+                operations.append((self._normalize_path(operation[0]), operation[1]))
+            self.operations = operations
+        else:
+            self.operations = [(self._normalize_path(path), value)]
+        if not self.operations:
+            raise FieldError("JSON set requires at least one operation")
+        self.bind_count = inner_bind_count + 2 * len(self.operations)
+
+    def resolve(
+        self, resolve_context: ResolveContext, parameter_offset: int | None = None
+    ) -> ResolveResult:
+        self._check_capability(resolve_context)
+
+        document, inner_bind_count = self._resolve_document(resolve_context, parameter_offset)
+        field_object = self._field_object(resolve_context)
+        function_operations = []
+        operation_offset = inner_bind_count
+        for operation_path, operation_value in self.operations:
+            path_bound = _JSONBoundValue(self._encode_path(operation_path))
+            value_bound = _JSONBoundValue(
+                self._serialize_value(field_object, operation_value)
+            )
+            if parameter_offset is not None:
+                path_bound.parameter_offset = parameter_offset + operation_offset
+                value_bound.parameter_offset = parameter_offset + operation_offset + 1
+            operation_offset += 2
+            function_operations.append((path_bound, PypikaFunction("json", value_bound)))
+
+        return ResolveResult(
+            term=_SQLiteJSONFunction("json_set", document, function_operations)
+        )
+
+
+class JSONRemove(JSONPathExpression):
+    """
+    Remove one JSON object member or array element without replacing the complete JSON field.
+
+    Removing a missing path or an index outside the existing array is a no-op. SQL NULL in the
+    target field is returned unchanged. Every path part is sent as a bind parameter.
+    """
+
+    def __init__(
+        self,
+        field: str | F | JSONPathExpression,
+        path: JSONPath | Sequence[JSONPath],
+        *extra_paths: JSONPath,
+    ) -> None:
+        self.field = field
+        if (
+            not extra_paths
+            and isinstance(path, Sequence)
+            and not isinstance(path, (str, bytes))
+            and path
+            and all(not isinstance(item, (str, int, bytes)) for item in path)
+            and all(
+                isinstance(item, Sequence) and not isinstance(item, (str, bytes))
+                for item in path
+            )
+        ):
+            paths_to_normalize = tuple(cast(Sequence[JSONPath], path))
+        else:
+            paths_to_normalize = (cast(JSONPath, path), *extra_paths)
+        self.paths = [self._normalize_path(item) for item in paths_to_normalize]
+        if not self.paths:
+            raise FieldError("JSON remove requires at least one path")
+        inner_bind_count = (
+            self.field.bind_count if isinstance(self.field, JSONPathExpression) else 0
+        )
+        self.bind_count = inner_bind_count + len(self.paths)
+
+    def resolve(
+        self, resolve_context: ResolveContext, parameter_offset: int | None = None
+    ) -> ResolveResult:
+        self._check_capability(resolve_context)
+
+        document, inner_bind_count = self._resolve_document(resolve_context, parameter_offset)
+        function_operations = []
+        operation_offset = inner_bind_count
+        for operation_path in self.paths:
+            path_bound = _JSONBoundValue(self._encode_path(operation_path))
+            if parameter_offset is not None:
+                path_bound.parameter_offset = parameter_offset + operation_offset
+            operation_offset += 1
+            function_operations.append((path_bound, None))
+        return ResolveResult(
+            term=_SQLiteJSONFunction("json_remove", document, function_operations)
+        )
 
 
 class Connector(Enum):

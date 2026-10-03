@@ -59,6 +59,7 @@ class SqliteClient(BaseDBAsyncClient):
         inline_comment=True,
         support_for_update=False,
         support_update_limit_order_by=False,
+        support_json_path_update=True,
         can_rollback_ddl=True,
         support_returning=True,
     )
@@ -285,6 +286,7 @@ class SqliteClientWithRegexpSupport(SqliteClient):
         support_for_update=False,
         support_update_limit_order_by=False,
         support_for_posix_regex_queries=True,
+        support_json_path_update=True,
         can_rollback_ddl=True,
         support_returning=True,
     )

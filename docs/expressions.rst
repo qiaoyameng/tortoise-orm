@@ -96,6 +96,57 @@ F expressions can also be used to reference JSON properties and array elements:
     await User.annotate(attr=F("json_field__property")).values_list("id", "attr")
     await User.annotate(attr=F("json_field__arrayproperty__0")).values_list("id", "attr")
 
+JSON Path Updates
+=================
+
+``JSONSet`` and ``JSONRemove`` update selected JSON paths in the database instead of reading
+the complete JSON value, modifying it in Python, and replacing the whole field. SQLite is
+supported in this version; unsupported backends raise an error.
+
+Paths are sequences of object keys and non-negative array indexes. Keys may contain dots or
+quotes; paths are encoded as bind parameters. Values are also bound and retain their JSON
+boolean, number, string, object, array and ``null`` types.
+
+.. code-block:: python3
+
+    from tortoise.expressions import JSONRemove, JSONSet
+
+    await Event.filter(pk=event.pk).update(
+        payload=JSONSet("payload", ("venue", "name"), "Hall A")
+    )
+    await Event.filter(pk=event.pk).update(
+        payload=JSONSet("payload", ("speakers", 0, "name"), "Ada")
+    )
+    await Event.filter(pk=event.pk).update(
+        payload=JSONRemove("payload", ("temporary",))
+    )
+
+Multiple operations on the same field can be composed, and they execute from the inner
+expression to the outer expression:
+
+.. code-block:: python3
+
+    expression = JSONRemove(
+        JSONSet(
+            "payload",
+            [
+                (("status",), "done"),
+                (("reviewed",), True),
+            ],
+        ),
+        ("draft",),
+        ("obsolete",),
+    )
+    await Event.filter(pk=event.pk).update(payload=expression)
+
+SQLite creates missing object and array parents for ``JSONSet``. Setting an array index beyond
+the existing array and removing a missing path or array index are no-operations. When the stored
+column value is SQL ``NULL``, the JSON function result is also SQL ``NULL``.
+
+.. autoclass:: tortoise.expressions.JSONSet
+.. autoclass:: tortoise.expressions.JSONRemove
+
+
 
 Subquery
 ========
