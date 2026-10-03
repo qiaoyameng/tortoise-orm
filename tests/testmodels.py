@@ -1220,3 +1220,61 @@ class Drink(Model):
     toppings = fields.ManyToManyField(
         Flavor, related_name="topping_drinks", through="drink_topping"
     )
+
+
+# --- Models for tortoise.save_graph graph persistence tests ---------------
+
+
+class GraphNodeBase(Model):
+    name = fields.CharField(max_length=50)
+
+    class Meta:
+        abstract = True
+
+
+class GraphShared(GraphNodeBase):
+    """Shared (diamond) node reached from several parents."""
+
+
+class GraphLeft(GraphNodeBase):
+    shared: fields.ForeignKeyRelation[GraphShared] = fields.ForeignKeyField(
+        "models.GraphShared", related_name="lefts"
+    )
+
+
+class GraphRight(GraphNodeBase):
+    shared: fields.ForeignKeyRelation[GraphShared] = fields.ForeignKeyField(
+        "models.GraphShared", related_name="rights"
+    )
+
+
+class GraphTop(GraphNodeBase):
+    left: fields.ForeignKeyRelation[GraphLeft] = fields.ForeignKeyField(
+        "models.GraphLeft", related_name="tops_left"
+    )
+    right: fields.ForeignKeyRelation[GraphRight] = fields.ForeignKeyField(
+        "models.GraphRight", related_name="tops_right"
+    )
+
+
+class GraphNullableA(Model):
+    name = fields.CharField(max_length=50)
+    # nullable self/peer reference used for the bidirectional cycle
+    peer: fields.ForeignKeyRelation["GraphNullableA"] = fields.ForeignKeyField(
+        "models.GraphNullableA", related_name="peers_back", null=True
+    )
+
+
+class GraphRequiredLink(Model):
+    name = fields.CharField(max_length=50)
+    other: fields.ForeignKeyRelation["GraphRequiredLink"] = fields.ForeignKeyField(
+        "models.GraphRequiredLink",
+        related_name="others_back",
+    )
+
+
+class GraphUniqueName(Model):
+    name = fields.CharField(max_length=50, unique=True)
+    required: fields.ForeignKeyRelation[GraphShared] = fields.ForeignKeyField(
+        "models.GraphShared", related_name="unique_names"
+    )

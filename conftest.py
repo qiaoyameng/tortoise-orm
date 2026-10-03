@@ -5,9 +5,47 @@ Uses function-scoped fixtures for true test isolation.
 """
 
 import os
+import sys
 
 import pytest
 import pytest_asyncio
+
+# Sandbox bootstrap: some restricted execution environments block the
+# ``send()`` syscall on sockets (EPERM). asyncio's cross-thread event-loop
+# wakeup relies on that syscall, which deadlocks DB driver worker threads
+# (e.g. aiosqlite). Fall back to a raw ``write()`` on the self-pipe fd,
+# which is allowed in such environments. The same bootstrap is exposed via a
+# sitecustomize directory below so subprocess-based tests inherit it too.
+_SANDBOX_SITECUSTOMIZE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tests", "_sandbox_bootstrap"
+)
+if sys.platform != "win32":
+    try:
+        import asyncio.unix_events as _unix_events
+
+        def _write_to_self(self) -> None:
+            csock = self._csock
+            if csock is None:
+                return
+            try:
+                os.write(csock.fileno(), b"\x00")
+            except OSError:
+                try:
+                    csock.send(b"\x00")
+                except OSError:
+                    pass
+
+        _unix_events._UnixSelectorEventLoop._write_to_self = _write_to_self
+    except (ImportError, AttributeError):  # pragma: no cover
+        pass
+
+    if os.path.isdir(_SANDBOX_SITECUSTOMIZE):
+        existing = os.environ.get("PYTHONPATH", "")
+        parts = existing.split(os.pathsep) if existing else []
+        if _SANDBOX_SITECUSTOMIZE not in parts:
+            os.environ["PYTHONPATH"] = os.pathsep.join(
+                [_SANDBOX_SITECUSTOMIZE, *parts]
+            )
 
 from tortoise.context import tortoise_test_context
 

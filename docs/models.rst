@@ -465,6 +465,44 @@ Sync usage requires that you call `fetch_related` before the time, and then you 
 
 The reverse lookup of ``team.event_team`` works exactly the same way.
 
+Saving a graph of related objects
+=================================
+
+When business logic creates a whole group of related objects at once,
+:func:`tortoise.save_graph` persists the complete graph through one entry
+point inside a single transaction::
+
+    from tortoise import save_graph, Edge
+
+    tournament = Tournament(name="Championship")
+    event = Event(name="Finals")
+
+    # ``event`` and ``tournament`` are both unsaved here; the edge accepts
+    # instances that do not have a primary key yet.
+    await save_graph(
+        [event, tournament],
+        [Edge(event, "tournament", tournament)],
+    )
+
+Behaviour:
+
+* Shared (diamond) objects are inserted only once.
+* Already saved instances act as reference boundaries and are never written.
+* The acyclic part is inserted ordered by foreign-key dependencies.
+* Nullable cycles insert the back-edge column as ``NULL`` first and backfill
+  it once both rows exist.
+* Non-nullable cycles are rejected with a path diagnostic before anything is
+  written.
+* A failure rolls the transaction back and restores allocated primary keys
+  and saved-state on the in-memory instances.
+* Traversal of pre-assigned relations is limited to the ``traverse``
+  whitelist, so unrelated objects are never saved implicitly. The whitelist
+  accepts model classes, ``"Model.field"``/``"app.Model.field"`` strings or
+  ``(model, "field")`` tuples.
+
+.. automodule:: tortoise.graph
+    :members: save_graph, Edge
+
 Improving relational type hinting
 =================================
 

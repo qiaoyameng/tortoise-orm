@@ -16,6 +16,7 @@ from tortoise.backends.base.config_generator import expand_db_url
 from tortoise.config import TortoiseConfig
 from tortoise.connection import connections, get_connection, get_connections
 from tortoise.exceptions import ConfigurationError
+from tortoise.graph import Edge, save_graph
 from tortoise.fields.relational import (
     BackwardFKRelation,
     BackwardOneToOneRelation,
@@ -572,6 +573,8 @@ def run_async(coro: Coroutine) -> None:
 __version__ = "1.1.8"
 
 __all__ = [
+    "Edge",
+    "save_graph",
     "BackwardFKRelation",
     "BackwardOneToOneRelation",
     "Model",
