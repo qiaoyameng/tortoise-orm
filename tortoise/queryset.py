@@ -3,6 +3,7 @@ from __future__ import annotations
 import types
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Collection, Generator, Iterable, Sequence
+from contextlib import aclosing
 from copy import copy
 from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeVar, cast, overload
 
@@ -21,6 +22,7 @@ from tortoise.exceptions import (
     MultipleObjectsReturned,
     OperationalError,
     ParamsError,
+    UnSupportedError,
 )
 from tortoise.expressions import Expression, Q, RawSQL, ResolveContext, ResolveResult, Value
 from tortoise.fields.base import DatabaseDefault
@@ -51,6 +53,15 @@ MODEL = TypeVar("MODEL", bound="Model")
 PRIMARY_KEY = TypeVar("PRIMARY_KEY")
 T_co = TypeVar("T_co", covariant=True)
 SINGLE = TypeVar("SINGLE", bound=bool)
+
+
+def _validate_streaming(db: BaseDBAsyncClient, chunk_size: int) -> None:
+    if chunk_size < 1:
+        raise ParamsError("chunk_size must be a positive integer")
+    if not db.capabilities.support_streaming:
+        raise UnSupportedError(
+            f"{db.__class__.__name__} does not support streaming iteration (.iterator())"
+        )
 
 
 class QuerySetSingle(Protocol[T_co]):
@@ -1326,6 +1337,44 @@ class QuerySet(AwaitableQuery[MODEL]):
         for val in await self:
             yield val
 
+    def iterator(self, chunk_size: int = 2000) -> AsyncIterator[MODEL]:
+        """
+        Streams matching rows from the database in chunks of ``chunk_size`` rows,
+        instead of loading the whole resultset into memory like ``async for`` does.
+
+        The underlying cursor is owned by the returned async iterator and is
+        released when iteration completes, when the iterator is closed early
+        (``aclose()``), is cancelled, or raises. Inside a transaction the
+        iteration uses the transaction's own connection.
+
+        ``prefetch_related()`` and single-object queries are not supported and
+        are rejected before anything is executed.
+        """
+        if self._db is None:
+            self._db = self._choose_db(self._select_for_update)
+        _validate_streaming(self._db, chunk_size)
+        if self._prefetch_map or self._prefetch_queries:
+            raise UnSupportedError("prefetch_related() is not supported with .iterator()")
+        if self._single:
+            raise UnSupportedError(".iterator() is not supported for single-object queries")
+        self._make_query()
+        return self._iterate(chunk_size)
+
+    async def _iterate(self, chunk_size: int) -> AsyncIterator[MODEL]:
+        executor = self._db.executor_class(
+            model=self.model,
+            db=self._db,
+            select_related_idx=self._select_related_idx,  # type: ignore
+        )
+        stream = executor.execute_select_stream(
+            *self.query.get_parameterized_sql(),
+            custom_fields=list(self._annotations.keys()),
+            chunk_size=chunk_size,
+        )
+        async with aclosing(stream) as instances:
+            async for instance in instances:
+                yield instance
+
     async def _execute(self) -> list[MODEL]:
         instance_list = await self._db.executor_class(
             model=self.model,
@@ -1862,6 +1911,35 @@ class ValuesListQuery(FieldSelectQuery, Generic[SINGLE]):
         for val in await self:
             yield val
 
+    def iterator(self, chunk_size: int = 2000) -> AsyncIterator[Any]:
+        """
+        Streams rows as tuples (or scalars when ``flat=True``) in chunks of
+        ``chunk_size`` rows, applying the same field conversion rules as awaiting
+        the query, without loading the whole resultset into memory.
+        """
+        self._choose_db_if_not_chosen()
+        _validate_streaming(self._db, chunk_size)
+        self._make_query()
+        return self._iterate(chunk_size)
+
+    async def _iterate(self, chunk_size: int) -> AsyncIterator[Any]:
+        columns = [
+            (key, self.resolve_to_python_value(self.model, name))
+            for key, name in self.fields.items()
+        ]
+        stream = self._db.execute_query_stream(
+            *self.query.get_parameterized_sql(), chunk_size=chunk_size
+        )
+        async with aclosing(stream) as chunks:
+            async for rows in chunks:
+                if self._flat:
+                    func = columns[0][1]
+                    for row in rows:
+                        yield func(row["0"])
+                else:
+                    for row in rows:
+                        yield tuple(func(row[column]) for column, func in columns)
+
     async def _execute(self) -> list[Any] | tuple:
         _, result = await self._db.execute_query(*self.query.get_parameterized_sql())
         columns = [
@@ -1991,6 +2069,36 @@ class ValuesQuery(FieldSelectQuery, Generic[SINGLE]):
     async def __aiter__(self: ValuesQuery[Any]) -> AsyncIterator[dict[str, Any]]:
         for val in await self:
             yield val
+
+    def iterator(self, chunk_size: int = 2000) -> AsyncIterator[dict[str, Any]]:
+        """
+        Streams rows as dicts in chunks of ``chunk_size`` rows, applying the same
+        field conversion rules as awaiting the query, without loading the whole
+        resultset into memory.
+        """
+        self._choose_db_if_not_chosen()
+        _validate_streaming(self._db, chunk_size)
+        self._make_query()
+        return self._iterate(chunk_size)
+
+    async def _iterate(self, chunk_size: int) -> AsyncIterator[dict[str, Any]]:
+        columns = [
+            val
+            for val in [
+                (alias, self.resolve_to_python_value(self.model, field_name))
+                for alias, field_name in self._fields_for_select.items()
+            ]
+            if not isinstance(val[1], types.LambdaType)
+        ]
+        stream = self._db.execute_query_stream(
+            *self.query.get_parameterized_sql(), chunk_size=chunk_size
+        )
+        async with aclosing(stream) as chunks:
+            async for rows in chunks:
+                for row in rows:
+                    for col, func in columns:
+                        row[col] = func(row[col])
+                    yield row
 
     async def _execute(self) -> list[dict] | dict:
         result = await self._db.execute_query_dict(*self.query.get_parameterized_sql())

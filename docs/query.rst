@@ -154,6 +154,27 @@ In cases like this you could use ``values()`` or ``values_list()`` to produce mo
     # And it will be done in one query
     events = await Event.filter(id__in=[1,2,3]).values('id', 'name', tournament_name='tournament__name')
 
+When exporting or processing large resultsets, loading everything into memory with
+``await`` (or ``async for``, which awaits the whole query first) may not be viable.
+``.iterator(chunk_size=...)`` streams rows from the database cursor in chunks instead,
+applying the same field conversion rules. It is available on regular queries as well as
+on ``values()`` and ``values_list()``:
+
+.. code-block:: python3
+
+    async for event in Event.all().iterator(chunk_size=1000):
+        ...  # rows are fetched from the cursor 1000 at a time
+
+    async for row in Event.all().values('id', 'name').iterator():
+        ...
+
+The cursor is owned by the iterator and is released when iteration completes, when the
+iterator is closed early (``await iterator.aclose()``), is cancelled, or raises. Inside
+a transaction the iteration uses the transaction's own connection. Note that
+``.iterator()`` is only available on backends that declare streaming support (currently
+SQLite); ``prefetch_related()`` and single-object queries are rejected before anything
+is executed.
+
 QuerySet also supports aggregation and database functions through ``.annotate()`` method
 
 .. code-block:: python3

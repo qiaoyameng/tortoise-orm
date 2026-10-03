@@ -3,7 +3,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import inspect
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from typing import Any, Generic, TypeAlias, TypeVar, cast
 
 from pypika_tortoise import Query
@@ -65,6 +65,8 @@ class Capabilities:
     :param can_rollback_ddl: Whether the database supports transactional DDL.
         Used to determine if migrations can be run atomically.
     :param support_returning: Indicates that this DB supports INSERT ... RETURNING.
+    :param support_streaming: Indicates that this DB supports streaming query results
+        in chunks from a server-side/driver cursor (see ``execute_query_stream``).
     """
 
     def __init__(
@@ -87,6 +89,7 @@ class Capabilities:
         support_json_attributes: bool = False,
         can_rollback_ddl: bool = False,
         support_returning: bool = False,
+        support_streaming: bool = False,
     ) -> None:
         super().__setattr__("_mutable", True)
 
@@ -103,6 +106,7 @@ class Capabilities:
         self.support_json_attributes = support_json_attributes
         self.can_rollback_ddl = can_rollback_ddl
         self.support_returning = support_returning
+        self.support_streaming = support_streaming
         super().__setattr__("_mutable", False)
 
     def __setattr__(self, attr: str, value: Any) -> None:
@@ -278,6 +282,23 @@ class BaseDBAsyncClient(abc.ABC):
         rowcount, rows = await self.execute_query(query, values)
         normalized = [dict(row) for row in rows]
         return normalized, rowcount
+
+    def execute_query_stream(
+        self, query: str, values: list | None = None, chunk_size: int = 2000
+    ) -> AsyncIterator[list[dict]]:
+        """
+        Executes a RAW SQL query statement and streams the resultset in chunks of
+        dicts, fetched lazily from a cursor owned by the returned iterator.
+
+        The cursor is released when the iterator is exhausted, closed early
+        (``aclose()``), or raises. Backends that cannot do this must not set
+        ``capabilities.support_streaming``.
+
+        :param query: The SQL string, pre-parametrized for the target DB dialect.
+        :param values: A sequence of positional DB parameters.
+        :param chunk_size: Maximum number of rows fetched from the cursor at a time.
+        """
+        raise NotImplementedError()  # pragma: nocoverage
 
 
 class TransactionalDBClient(BaseDBAsyncClient, abc.ABC):

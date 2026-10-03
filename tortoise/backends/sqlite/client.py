@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sqlite3
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from functools import wraps
 from itertools import count
 from typing import Any, TypeVar, cast
@@ -61,6 +61,7 @@ class SqliteClient(BaseDBAsyncClient):
         support_update_limit_order_by=False,
         can_rollback_ddl=True,
         support_returning=True,
+        support_streaming=True,
     )
 
     def __init__(self, file_path: str, **kwargs: Any) -> None:
@@ -167,6 +168,30 @@ class SqliteClient(BaseDBAsyncClient):
         async with self.acquire_connection() as connection:
             self.log.debug(query)
             await connection.executescript(query)
+
+    async def execute_query_stream(
+        self, query: str, values: list | None = None, chunk_size: int = 2000
+    ) -> AsyncIterator[list[dict]]:
+        query = query.replace("\x00", "'||CHAR(0)||'")
+        try:
+            # The lock is only held to ensure the connection exists and to create
+            # the cursor; fetching then happens cursor-by-cursor so that other
+            # queries on the same connection are not blocked while streaming.
+            async with self.acquire_connection() as connection:
+                self.log.debug("%s: %s", query, values)
+                cursor = await connection.execute(query, values or [])
+            try:
+                while True:
+                    rows = await cursor.fetchmany(chunk_size)
+                    if not rows:
+                        break
+                    yield [dict(row) for row in rows]
+            finally:
+                await cursor.close()
+        except sqlite3.OperationalError as exc:
+            raise OperationalError(exc)
+        except sqlite3.IntegrityError as exc:
+            raise IntegrityError(exc)
 
 
 class SqliteTransactionContext(TransactionContext):
@@ -287,6 +312,7 @@ class SqliteClientWithRegexpSupport(SqliteClient):
         support_for_posix_regex_queries=True,
         can_rollback_ddl=True,
         support_returning=True,
+        support_streaming=True,
     )
 
     async def create_connection(self, with_db: bool) -> None:
