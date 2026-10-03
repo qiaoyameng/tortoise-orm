@@ -1220,3 +1220,18 @@ class Drink(Model):
     toppings = fields.ManyToManyField(
         Flavor, related_name="topping_drinks", through="drink_topping"
     )
+
+
+class CompositeTenantItem(Model):
+    tenant_id = fields.IntField()
+    code = fields.CharField(max_length=32)
+    name = fields.CharField(max_length=128, null=True)
+
+    class Meta:
+        table = "composite_tenant_item"
+        primary_key = ("tenant_id", "code")
+
+
+class SimplePkModel(Model):
+    id = fields.IntField(primary_key=True)
+    name = fields.CharField(max_length=64)

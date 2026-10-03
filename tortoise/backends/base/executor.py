@@ -72,9 +72,12 @@ class BaseExecutor:
 
             table = self.model._meta.basetable
             basequery = cast(QueryBuilder, self.model._meta.basequery)
-            self.delete_query = str(
-                basequery.where(table[self.model._meta.db_pk_column] == self.parameter(0)).delete()
-            )
+            delete_query = basequery.delete()
+            for index, db_pk_column in enumerate(self.model._meta.db_pk_columns):
+                delete_query = delete_query.where(
+                    table[db_pk_column] == self.parameter(index)
+                )
+            self.delete_query = str(delete_query)
             self.update_cache: dict[str, str] = {}
 
             EXECUTOR_CACHE[key] = (
@@ -387,19 +390,17 @@ class BaseExecutor:
             return
 
         # Need PK to SELECT
-        if instance.pk is None:
+        if not instance._has_pk():
             return
 
         # Build SELECT via pypika for proper quoting
         table = self.model._meta.basetable
-        pk_col = self.model._meta.db_pk_column
-        query = (
-            self.db.query_class.from_(table)
-            .select(*fields_to_fetch)
-            .where(table[pk_col] == self.parameter(0))
+        query = self.db.query_class.from_(table).select(*fields_to_fetch)
+        for index, pk_col in enumerate(self.model._meta.db_pk_columns):
+            query = query.where(table[pk_col] == self.parameter(index))
+        _, rows = await self.db.execute_query(
+            str(query), self.model._meta.pk_db_values(instance)
         )
-        pk_value = self.model._meta.pk.to_db_value(instance.pk, instance)
-        _, rows = await self.db.execute_query(str(query), [pk_value])
 
         if rows:
             row = rows[0]
@@ -451,7 +452,9 @@ class BaseExecutor:
                     )
                     query = query.set(db_column, value)
 
-        query = query.where(table[self.model._meta.db_pk_column] == self.parameter(parameter_idx))
+        for db_pk_column in self.model._meta.db_pk_columns:
+            query = query.where(table[db_pk_column] == self.parameter(parameter_idx))
+            parameter_idx += 1
 
         sql = query.get_sql()
         if not expressions:
@@ -472,7 +475,7 @@ class BaseExecutor:
         effective_fields: list[str] = []
         for field in source_fields:
             field_obj = self.model._meta.fields_map[field]
-            if field_obj.pk:
+            if field_obj.pk or (user_specified and field in self.model._meta.pk_attrs):
                 if user_specified:
                     raise OperationalError(
                         f"Can't update pk field, use `{self.model.__name__}.create` instead."
@@ -500,7 +503,7 @@ class BaseExecutor:
                 field_obj = self.model._meta.fields_map[field]
                 values.append(field_obj.to_db_value(instance_field, instance))
 
-        values.append(self.model._meta.pk.to_db_value(instance.pk, instance))
+        values.extend(self.model._meta.pk_db_values(instance))
         return (
             await self.db.execute_query(self.get_update_sql(effective_fields, expressions), values)
         )[0]
@@ -508,7 +511,7 @@ class BaseExecutor:
     async def execute_delete(self, instance: type[Model] | Model) -> int:
         return (
             await self.db.execute_query(
-                self.delete_query, [self.model._meta.pk.to_db_value(instance.pk, instance)]
+                self.delete_query, self.model._meta.pk_db_values(instance)
             )
         )[0]
 

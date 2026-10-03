@@ -30,6 +30,13 @@ class ModelDescription:
 
     @classmethod
     def from_model(cls, model: type[Model]) -> Self:
+        if model._meta.is_composite_pk:
+            from tortoise.exceptions import ConfigurationError
+
+            raise ConfigurationError(
+                f"pydantic model creator does not support models with a composite primary "
+                f"key ({', '.join(model._meta.pk_attrs)}) for {model.__name__}"
+            )
         return cls(
             pk_field=model._meta.fields_map[model._meta.pk_attr],
             data_fields=[

@@ -21,6 +21,7 @@ from tortoise.exceptions import (
     MultipleObjectsReturned,
     OperationalError,
     ParamsError,
+    UnSupportedError,
 )
 from tortoise.expressions import Expression, Q, RawSQL, ResolveContext, ResolveResult, Value
 from tortoise.fields.base import DatabaseDefault
@@ -46,6 +47,78 @@ QUERY: QueryBuilder = QueryBuilder()
 
 if TYPE_CHECKING:  # pragma: nocoverage
     from tortoise.models import Model
+
+
+def _expand_composite_pk_filter(
+    model: type["Model"], key: str, value: Any
+) -> tuple[str, Any] | None:
+    """Expand a ``pk`` lookup on a composite-primary-key model.
+
+    Returns ``None`` for models with a single-column primary key.
+    """
+    if not model._meta.is_composite_pk:
+        return None
+    pk_attrs = model._meta.pk_attrs
+    if key == "pk__in":
+        return ("__composite_q__", _build_composite_in_q(model, value))
+    if key == "pk":
+        if not isinstance(value, (tuple, list)) or len(value) != len(pk_attrs):
+            raise FieldError(
+                f"pk for {model.__name__} must be a tuple of "
+                f"{len(pk_attrs)} values ({', '.join(pk_attrs)})"
+            )
+        return ("__fields__", dict(zip(pk_attrs, value)))
+    if key.startswith("pk__"):
+        raise FieldError(
+            f"Lookup '{key}' is not supported on the composite primary key "
+            f"({', '.join(pk_attrs)}) of {model.__name__}; use 'pk' or 'pk__in'"
+        )
+    return None
+
+
+def _build_composite_in_q(model: type["Model"], values: Any) -> Q:
+    """Build a Q for ``pk__in`` on a composite-primary-key model.
+
+    An empty list expands to an always-false criterion (``field__in=[]``).
+    """
+    pk_attrs = model._meta.pk_attrs
+    if len(values) == 0:
+        return Q(**{f"{pk_attrs[0]}__in": []})
+    children: list[Q] = []
+    for item in values:
+        if not isinstance(item, (tuple, list)) or len(item) != len(pk_attrs):
+            raise FieldError(
+                f"pk elements for {model.__name__} must be tuples of "
+                f"{len(pk_attrs)} values ({', '.join(pk_attrs)})"
+            )
+        children.append(Q(**dict(zip(pk_attrs, item))))
+    return Q(*children, join_type=Q.OR)
+
+
+def _rewrite_composite_pk_q(model: type["Model"], q: Q) -> Q:
+    """Rewrite every ``pk`` filter inside a Q tree for composite primary keys."""
+    if not model._meta.is_composite_pk:
+        return q
+    new_filters: dict[str, Any] = {}
+    extra_children: list[Q] = []
+    for key, value in q.filters.items():
+        expanded = _expand_composite_pk_filter(model, key, value)
+        if expanded is None:
+            new_filters[key] = value
+        elif expanded[0] == "__composite_q__":
+            extra_children.append(expanded[1])
+        else:
+            new_filters.update(expanded[1])
+    new_children = tuple(_rewrite_composite_pk_q(model, child) for child in q.children)
+    if new_filters:
+        rewritten = Q(*new_children, join_type=q.join_type, **new_filters)
+        for child in extra_children:
+            rewritten &= child
+    else:
+        rewritten = Q(*new_children, *extra_children, join_type=q.join_type)
+    rewritten._is_negated = q._is_negated
+    return rewritten
+
 
 MODEL = TypeVar("MODEL", bound="Model")
 PRIMARY_KEY = TypeVar("PRIMARY_KEY")
@@ -436,19 +509,31 @@ class QuerySet(AwaitableQuery[MODEL]):
 
     def _filter_or_exclude(self, *args: Q, negate: bool, **kwargs: Any) -> QuerySet[MODEL]:
         queryset = self._clone()
+        composite = self.model._meta.is_composite_pk
         for arg in args:
             if not isinstance(arg, Q):
                 raise TypeError("expected Q objects as args")
+            if composite:
+                arg = _rewrite_composite_pk_q(self.model, arg)
             if negate:
                 queryset._q_objects.append(~arg)
             else:
                 queryset._q_objects.append(arg)
 
         for key, value in kwargs.items():
-            if negate:
-                queryset._q_objects.append(~Q(**{key: value}))
+            q_obj: Q
+            if composite and (key == "pk" or key.startswith("pk__")):
+                expanded = _expand_composite_pk_filter(self.model, key, value)
+                if expanded[0] == "__composite_q__":
+                    q_obj = expanded[1]
+                else:
+                    q_obj = Q(**expanded[1])
             else:
-                queryset._q_objects.append(Q(**{key: value}))
+                q_obj = Q(**{key: value})
+            if negate:
+                queryset._q_objects.append(~q_obj)
+            else:
+                queryset._q_objects.append(q_obj)
 
         return queryset
 
@@ -864,7 +949,7 @@ class QuerySet(AwaitableQuery[MODEL]):
         if not isinstance(obj, self.model):
             raise ParamsError("The given object is not an instance of the queryset's model.")
 
-        if not obj.pk:
+        if not obj._has_pk():
             raise ParamsError("The given object does not have a primary key.")
 
         return ContainsQuery(
@@ -909,8 +994,8 @@ class QuerySet(AwaitableQuery[MODEL]):
                 (field, Order.desc if order_type == Order.asc else Order.asc)
                 for field, order_type in queryset._orderings
             ]
-        elif pk := self.model._meta.pk:
-            new_ordering = [(pk.model_field_name, Order.desc)]
+        elif self.model._meta.pk_attrs:
+            new_ordering = [(attr, Order.desc) for attr in self.model._meta.pk_attrs]
         else:
             raise FieldError(
                 f"QuerySet has no ordering and model {self.model.__name__} has no pk defined"
@@ -929,7 +1014,9 @@ class QuerySet(AwaitableQuery[MODEL]):
         return queryset  # type: ignore
 
     async def in_bulk(
-        self, id_list: Iterable[PRIMARY_KEY], field_name: str
+        self,
+        id_list: Iterable[PRIMARY_KEY] | None = None,
+        field_name: str = "pk",
     ) -> dict[PRIMARY_KEY, MODEL]:
         """
         Return a dictionary mapping each of the given IDs to the object with
@@ -938,7 +1025,12 @@ class QuerySet(AwaitableQuery[MODEL]):
         :param id_list: A list of field values
         :param field_name: Must be a unique field
         """
-        objs = await self.filter(**{f"{field_name}__in": id_list})
+        queryset = self
+        if id_list is not None:
+            queryset = self.filter(**{f"{field_name}__in": id_list})
+        objs = await queryset
+        if field_name == "pk":
+            return {obj.pk: obj for obj in objs}
         return {getattr(obj, field_name): obj for obj in objs}
 
     def bulk_create(
@@ -997,6 +1089,11 @@ class QuerySet(AwaitableQuery[MODEL]):
 
         :raises ValueError: If objects have no primary key set
         """
+        objects = list(objects)
+        if self.model._meta.is_composite_pk:
+            raise UnSupportedError(
+                "bulk_update() is not supported for models with a composite primary key"
+            )
         if any(obj.pk is None for obj in objects):
             raise ValueError("All bulk_update() objects must have a primary key set.")
         return BulkUpdateQuery(
@@ -1555,9 +1652,11 @@ class ContainsQuery(ExistsQuery):
 
     def _make_query(self) -> None:
         super()._make_query()
-        pk_field = Field(self.model._meta.db_pk_column)
-        pk_value = self.model._meta.pk.to_db_value(self._obj.pk, self._obj)
-        self.query = self.query.where(pk_field.eq(pk_value))
+        for db_column, pk_value in zip(
+            self.model._meta.db_pk_columns,
+            self.model._meta.pk_db_values(self._obj),
+        ):
+            self.query = self.query.where(Field(db_column).eq(pk_value))
 
 
 class CountQuery(AwaitableQuery):
@@ -1601,8 +1700,11 @@ class CountQuery(AwaitableQuery):
             # ``DISTINCT`` on the outer SELECT does not apply to ``COUNT(*)``,
             # so rows duplicated by a join would still be counted. Count the
             # distinct primary keys instead.
-            pk_field: Field = self.model._meta.basetable[self.model._meta.db_pk_column]
-            count_term = DistinctCount(pk_field).distinct()
+            if self.model._meta.is_composite_pk:
+                count_term = Count(Star())
+            else:
+                pk_field: Field = self.model._meta.basetable[self.model._meta.db_pk_column]
+                count_term = DistinctCount(pk_field).distinct()
         else:
             count_term = Count(Star())
             if self.query._groupbys:

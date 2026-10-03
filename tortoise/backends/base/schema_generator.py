@@ -31,6 +31,7 @@ class BaseSchemaGenerator(SchemaQuotingMixin):
     )
     UNIQUE_INDEX_CREATE_TEMPLATE = INDEX_CREATE_TEMPLATE.replace("INDEX", "UNIQUE INDEX")
     UNIQUE_CONSTRAINT_CREATE_TEMPLATE = 'CONSTRAINT "{index_name}" UNIQUE ({fields})'
+    COMPOSITE_PK_TEMPLATE = "PRIMARY KEY ({fields})"
     GENERATED_PK_TEMPLATE = '"{field_name}" {generated_sql}{comment}'
     FK_TEMPLATE = ' REFERENCES {table} ("{field}") ON DELETE {on_delete}{comment}'
     M2M_TABLE_TEMPLATE = (
@@ -209,6 +210,11 @@ class BaseSchemaGenerator(SchemaQuotingMixin):
         return self.UNIQUE_CONSTRAINT_CREATE_TEMPLATE.format(
             index_name=self._get_index_name("uid", model, field_names),
             fields=", ".join([self.quote(f) for f in field_names]),
+        )
+
+    def _get_composite_pk_sql(self, model: type[Model]) -> str:
+        return self.COMPOSITE_PK_TEMPLATE.format(
+            fields=", ".join(self.quote(column) for column in model._meta.db_pk_columns)
         )
 
     def _get_pk_field_sql_type(self, pk_field: Field) -> str:
@@ -476,6 +482,9 @@ class BaseSchemaGenerator(SchemaQuotingMixin):
                 fields_to_create.append(
                     self._get_unique_constraint_sql(model, unique_together_to_create)
                 )
+
+        if model._meta.is_composite_pk:
+            fields_to_create.append(self._get_composite_pk_sql(model))
 
         field_indexes_sqls = self._get_field_indexes_sqls(model, fields_with_index, safe)
 

@@ -183,6 +183,14 @@ class Apps:
                         f'field "{to_field}" in model "{related_model_name}" is not unique'
                     )
             else:
+                if related_model._meta.is_composite_pk:
+                    raise ConfigurationError(
+                        f'Relation field "{field}" on model "{model.__name__}" targets model '
+                        f'"{related_model_name}" which has a composite primary key '
+                        f'({", ".join(related_model._meta.pk_attrs)}). Relations on composite '
+                        "primary keys are not supported yet; specify an explicit single-column "
+                        '"to_field" with a unique constraint instead.'
+                    )
                 fk_object.to_field = related_model._meta.pk_attr
                 related_field = related_model._meta.pk
             key_fk_object = copy(related_field)
@@ -271,6 +279,16 @@ class Apps:
                         related_model = get_related_model(related_app_name, related_model_name)
 
                     m2m_object.related_model = related_model
+
+                    if model._meta.is_composite_pk or related_model._meta.is_composite_pk:
+                        raise ConfigurationError(
+                            f'ManyToMany field "{field}" on model "{model_name}" can\'t target '
+                            f'a model with a composite primary key '
+                            f'(model "{model_name}": ({", ".join(model._meta.pk_attrs)}); '
+                            f'model "{related_model_name}": '
+                            f'({", ".join(related_model._meta.pk_attrs)})). '
+                            "ManyToMany relations on composite primary keys are not supported yet."
+                        )
 
                     if not (backward_relation_name := m2m_object.related_name):
                         backward_relation_name = m2m_object.related_name = (
