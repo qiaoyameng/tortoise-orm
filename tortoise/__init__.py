@@ -23,6 +23,7 @@ from tortoise.fields.relational import (
     ManyToManyFieldInstance,
     OneToOneFieldInstance,
 )
+from tortoise.identity import IdentityScope, identity_scope
 from tortoise.log import logger
 from tortoise.models import Model, ModelMeta
 from tortoise.timezone import _reset_timezone_cache
@@ -576,6 +577,7 @@ __all__ = [
     "BackwardOneToOneRelation",
     "Model",
     "ForeignKeyFieldInstance",
+    "IdentityScope",
     "ManyToManyFieldInstance",
     "OneToOneFieldInstance",
     "Tortoise",
@@ -583,4 +585,5 @@ __all__ = [
     "TortoiseConfig",
     "__version__",
     "connections",
+    "identity_scope",
 ]

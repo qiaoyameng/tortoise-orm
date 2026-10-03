@@ -30,6 +30,7 @@ from tortoise.fields.relational import (
     RelationalField,
 )
 from tortoise.filters import FilterInfoDict
+from tortoise.identity import get_current_identity_scope
 from tortoise.query_utils import (
     Prefetch,
     QueryModifier,
@@ -371,6 +372,7 @@ class QuerySet(AwaitableQuery[MODEL]):
         "_select_related_idx",
         "_use_indexes",
         "_force_indexes",
+        "_ignore_identity",
     )
 
     def __init__(self, model: type[MODEL]) -> None:
@@ -399,6 +401,7 @@ class QuerySet(AwaitableQuery[MODEL]):
         ] = []  # format with: model,idx,model_name,parent_model
         self._force_indexes: set[str] = set()
         self._use_indexes: set[str] = set()
+        self._ignore_identity: bool = False
 
     def _clone(self) -> QuerySet[MODEL]:
         queryset = self.__class__.__new__(self.__class__)
@@ -432,6 +435,7 @@ class QuerySet(AwaitableQuery[MODEL]):
         queryset._select_related_idx = self._select_related_idx
         queryset._force_indexes = self._force_indexes
         queryset._use_indexes = self._use_indexes
+        queryset._ignore_identity = self._ignore_identity
         return queryset
 
     def _filter_or_exclude(self, *args: Q, negate: bool, **kwargs: Any) -> QuerySet[MODEL]:
@@ -1193,7 +1197,11 @@ class QuerySet(AwaitableQuery[MODEL]):
             fetch_to_fields[fetch_fields_lookup].append(field_name)
 
         # select direct model fields which would have the key "": {"": ["a", "b"]}
-        data_fields = fetch_to_fields.pop("", None)
+        data_fields = list(fetch_to_fields.pop("", ()))
+        if get_current_identity_scope() is not None:
+            pk_attr = self.model._meta.pk_attr
+            if pk_attr not in data_fields:
+                data_fields.append(pk_attr)
         if data_fields:
             table = self.model._meta.basetable
             self._select_related_idx.append(
@@ -1244,6 +1252,12 @@ class QuerySet(AwaitableQuery[MODEL]):
                 table = self._join_table_by_field(table, field.model_field_name, field)
                 referring_model = model
                 model = field.related_model
+                if (
+                    i == len(fetch_fields) - 1
+                    and get_current_identity_scope() is not None
+                    and model._meta.pk_attr not in data_fields
+                ):
+                    data_fields.append(model._meta.pk_attr)
 
                 if path in added_paths:
                     continue
@@ -1333,6 +1347,7 @@ class QuerySet(AwaitableQuery[MODEL]):
             prefetch_map=self._prefetch_map,
             prefetch_queries=self._prefetch_queries,
             select_related_idx=self._select_related_idx,  # type: ignore
+            ignore_identity=self._ignore_identity,
         ).execute_select(
             *self.query.get_parameterized_sql(),
             custom_fields=list(self._annotations.keys()),
@@ -1492,7 +1507,11 @@ class DeleteQuery(AwaitableQuery):
         return self._execute().__await__()
 
     async def _execute(self) -> int:
-        return (await self._db.execute_query(*self.query.get_parameterized_sql()))[0]
+        from tortoise.identity import evict_model
+
+        result = (await self._db.execute_query(*self.query.get_parameterized_sql()))[0]
+        evict_model(self._db, self.model)
+        return result
 
 
 class ExistsQuery(AwaitableQuery):
@@ -2115,9 +2134,14 @@ class BulkUpdateQuery(UpdateQuery, Generic[MODEL]):
         return [query.get_parameterized_sql() for query in self._queries]
 
     async def _execute_many(self, queries_with_params: list[tuple[str, list[Any]]]) -> int:
+        from tortoise.identity import clear_dirty_fields
+
+        updated_fields = set(self.fields)
         count = 0
         for sql, values in queries_with_params:
             count += (await self._db.execute_query(sql, values))[0]
+        for instance in self._objects:
+            clear_dirty_fields(instance, updated_fields)
         return count
 
     def __await__(self) -> Generator[Any, Any, int]:
@@ -2275,6 +2299,8 @@ class BulkCreateQuery(AwaitableQuery, Generic[MODEL]):
         effective_columns: list[str],
         effective_columns_all: list[str],
     ) -> None:
+        from tortoise.identity import register_instance
+
         fields_map = self.model._meta.fields_map
         for instance_chunk in chunk(self._objects, self._batch_size):
             values_lists_all = []
@@ -2315,6 +2341,8 @@ class BulkCreateQuery(AwaitableQuery, Generic[MODEL]):
                 await self._db.execute_insert(insert_sql_all, [])
             for _ in range(count_default):
                 await self._db.execute_insert(insert_sql, [])
+            for instance in instance_chunk:
+                register_instance(self._db, instance)
 
     def __await__(self) -> Generator[Any, None, None]:
         self._choose_db_if_not_chosen(True)

@@ -39,6 +39,12 @@ from tortoise.fields.relational import (
     ReverseRelation,
 )
 from tortoise.filters import FilterInfoDict, get_filters_for_field
+from tortoise.identity import (
+    clear_dirty_fields,
+    evict_instance,
+    mark_field_dirty,
+    register_instance,
+)
 from tortoise.indexes import Index
 from tortoise.manager import Manager
 from tortoise.queryset import (
@@ -98,8 +104,12 @@ def _fk_setter(
     relation_field: str,
     to_field: str,
 ) -> None:
-    setattr(self, relation_field, getattr(value, to_field) if value else None)
-    setattr(self, _key, value)
+    if value is not None:
+        self._validate_relation_type(_key.lstrip("_"), value)
+    mark_field_dirty(self, relation_field)
+    mark_field_dirty(self, _key.lstrip("_"))
+    object.__setattr__(self, relation_field, getattr(value, to_field) if value else None)
+    object.__setattr__(self, _key, value)
 
 
 def _fk_getter(
@@ -771,6 +781,7 @@ class Model(metaclass=ModelMeta):
         # set field value override async default function
         if hasattr(self, "_await_when_save"):
             self._await_when_save.pop(key, None)
+        mark_field_dirty(self, key)
         if key in self._meta.fk_fields or key in self._meta.o2o_fields:
             self._validate_relation_type(key, value)
         super().__setattr__(key, value)
@@ -1153,6 +1164,7 @@ class Model(metaclass=ModelMeta):
         await self._set_async_default_field()
         db = using_db or self._choose_db(True)
         executor = db.executor_class(model=self.__class__, db=db)
+        updated_fields = set(update_fields) if update_fields is not None else None
         if self._partial:
             if update_fields:
                 for field in update_fields:
@@ -1169,6 +1181,7 @@ class Model(metaclass=ModelMeta):
                     f"{self.__class__.__name__} is a partial model, can only be saved with the relevant update_field provided"
                 )
         await self._pre_save(db, update_fields)
+        created = False
 
         if force_create:
             await executor.execute_insert(self)
@@ -1192,6 +1205,11 @@ class Model(metaclass=ModelMeta):
                 created = True
 
         self._saved_in_db = True
+        register_instance(db, self)
+        if created or update_fields is None:
+            clear_dirty_fields(self)
+        else:
+            clear_dirty_fields(self, updated_fields)
         await self._post_save(db, created, update_fields)
 
     async def delete(self, using_db: BaseDBAsyncClient | None = None) -> None:
@@ -1207,6 +1225,7 @@ class Model(metaclass=ModelMeta):
             raise OperationalError("Can't delete unpersisted record")
         await self._pre_delete(db)
         await db.executor_class(model=self.__class__, db=db).execute_delete(self)
+        evict_instance(db, self)
         await self._post_delete(db)
 
     async def fetch_related(self, *args: Any, using_db: BaseDBAsyncClient | None = None) -> None:
@@ -1247,10 +1266,17 @@ class Model(metaclass=ModelMeta):
         qs = QuerySet(self.__class__).using_db(db)
         if fields:
             qs = qs.only(*fields)
+        qs._ignore_identity = True
         obj = await qs.get(pk=self.pk)
 
-        for field in fields or self._meta.db_fields:
-            setattr(self, field, getattr(obj, field, None))
+        refreshed_fields = set(fields or self._meta.db_fields)
+        for field in refreshed_fields:
+            object.__setattr__(self, field, getattr(obj, field, None))
+        if fields is None or not self._partial:
+            object.__setattr__(self, "_partial", False)
+        else:
+            object.__setattr__(self, "_partial", obj._partial)
+        clear_dirty_fields(self, refreshed_fields)
 
     @classmethod
     def _choose_db(cls, for_write: bool = False) -> BaseDBAsyncClient:

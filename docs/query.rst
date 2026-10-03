@@ -50,6 +50,31 @@ The related objects can be filtered:
 
 which will return you a QuerySet object with predefined filter.
 
+Identity scopes
+===============
+
+By default, Tortoise constructs a fresh Python instance for every query row. Use
+``tortoise.identity_scope()`` to explicitly reuse instances within one async task:
+
+.. code-block:: python3
+
+    from tortoise import identity_scope
+
+    async with identity_scope():
+        event = await Event.get(pk=1)
+        same_event = await Event.filter(pk=1).only("event_id", "name").first()
+        assert event is same_event
+
+Identity is the tuple ``(connection name, model class, primary key)``. Nested scopes reuse
+their parent scope, while scopes entered in concurrent tasks get independent maps. A later
+``only()`` or deferred field load fills missing fields, but never replaces a value assigned
+locally. ``select_related()`` and ``prefetch_related()`` use the same mapping.
+
+``delete()`` evicts that one object and queryset deletes evict the whole model.
+``refresh_from_db()`` intentionally bypasses the map and overwrites the refreshed fields on
+the current instance. Transaction and savepoint rollbacks invalidate cached objects for the
+rolled-back connection, so the next query constructs fresh instances.
+
 You can also create related objects directly through the reverse ForeignKey relation:
 
 .. code-block:: python3

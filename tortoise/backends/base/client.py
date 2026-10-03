@@ -377,6 +377,9 @@ class TransactionContextPooled(TransactionContext):
                     # Can't rollback a transaction that already failed.
                     if exc_type is not TransactionManagementError:
                         await self.client.rollback()
+                        from tortoise.identity import evict_connection
+
+                        evict_connection(self.connection_name)
                 else:
                     await self.client.commit()
         finally:
@@ -402,6 +405,9 @@ class NestedTransactionContext(TransactionContext):
                 # Can't rollback a transaction that already failed.
                 if exc_type is not TransactionManagementError:
                     await self.client.savepoint_rollback()
+                    from tortoise.identity import evict_connection
+
+                    evict_connection(self.connection_name)
             else:
                 await self.client.release_savepoint()
 

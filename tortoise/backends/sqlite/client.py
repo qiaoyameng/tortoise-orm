@@ -22,13 +22,13 @@ from tortoise.backends.base.client import (
 from tortoise.backends.sqlite.executor import SqliteExecutor
 from tortoise.backends.sqlite.schema_generator import SqliteSchemaGenerator
 from tortoise.connection import get_connections
-from tortoise.contrib.sqlite.regex import (
-    install_regexp_functions as install_regexp_functions_to_db,
-)
 from tortoise.exceptions import (
     IntegrityError,
     OperationalError,
     TransactionManagementError,
+)
+from tortoise.contrib.sqlite.regex import (
+    install_regexp_functions as install_regexp_functions_to_db,
 )
 
 T = TypeVar("T")
@@ -204,6 +204,9 @@ class SqliteTransactionContext(TransactionContext):
                     # Can't rollback a transaction that already failed.
                     if exc_type is not TransactionManagementError:
                         await self.connection.rollback()
+                        from tortoise.identity import evict_connection
+
+                        evict_connection(self.connection_name)
                 else:
                     await self.connection.commit()
         finally:

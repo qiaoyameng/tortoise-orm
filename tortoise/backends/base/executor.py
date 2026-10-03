@@ -19,6 +19,7 @@ from tortoise.fields.relational import (
     ManyToManyFieldInstance,
     RelationalField,
 )
+from tortoise.identity import get_current_identity_scope, load_related
 from tortoise.query_utils import QueryModifier
 
 if TYPE_CHECKING:  # pragma: nocoverage
@@ -50,12 +51,14 @@ class BaseExecutor:
         select_related_idx: (
             list[tuple[type[Model], int, str, type[Model], Iterable[str | None]]] | None
         ) = None,
+        ignore_identity: bool = False,
     ) -> None:
         self.model = model
         self.db: BaseDBAsyncClient = db
         self.prefetch_map = prefetch_map or {}
         self._prefetch_queries = prefetch_queries or {}
         self.select_related_idx = select_related_idx
+        self.ignore_identity = ignore_identity
         key = (self.db.connection_name, self.model._meta.schema, self.model._meta.db_table)
         if key not in EXECUTOR_CACHE:
             self.regular_columns, columns = self._prepare_insert_columns()
@@ -127,7 +130,18 @@ class BaseExecutor:
             if self.select_related_idx:
                 _, current_idx, _, _, path = self.select_related_idx[0]
                 row_items = list(dict(row).items())
-                instance: Model = self.model._init_from_db(**dict(row_items[:current_idx]))
+                root_values = dict(row_items[:current_idx])
+                identity_scope = None if self.ignore_identity else get_current_identity_scope()
+                instance: Model = (
+                    identity_scope.merge(
+                        self.db,
+                        self.model,
+                        root_values,
+                        custom_fields=custom_fields,
+                    )
+                    if identity_scope is not None and self._has_pk(root_values)
+                    else self.model._init_from_db(**root_values)
+                )
                 instances: dict[Any, Any] = {path: instance}
                 for model, index, *__, full_path in self.select_related_idx[1:]:
                     (*path, attr) = full_path
@@ -139,7 +153,10 @@ class BaseExecutor:
                             if fname is None:
                                 fname = _split_cache[k] = k.split(".", 1)[1]
                             related_kwargs[fname] = v
-                        obj = model._init_from_db(**related_kwargs)
+                        if identity_scope is not None and self._has_pk(related_kwargs, model):
+                            obj = identity_scope.merge(self.db, model, related_kwargs)
+                        else:
+                            obj = model._init_from_db(**related_kwargs)
                     elif index == 0:
                         # 0 signals that an empty "filler" object should be created in the case
                         # where a field of related model is selected but model itself isn't,
@@ -149,24 +166,44 @@ class BaseExecutor:
                         obj = None
                     target = instances.get(tuple(path))
                     if target is not None:
-                        object.__setattr__(target, f"_{attr}", obj)
+                        load_related(self.db, target, attr, obj)
                     if obj is not None:
                         instances[(*path, attr)] = obj
                     current_idx += index
             else:
-                instance = self.model._init_from_db(**row)
+                identity_scope = None if self.ignore_identity else get_current_identity_scope()
+                row_values = dict(row)
+                if identity_scope is not None and self._has_pk(row_values):
+                    instance = identity_scope.merge(
+                        self.db,
+                        self.model,
+                        row_values,
+                        custom_fields=custom_fields,
+                    )
+                else:
+                    instance = self.model._init_from_db(**row)
             if custom_fields:
                 for field in custom_fields:
-                    object.__setattr__(instance, field, row[field])
+                    if identity_scope is None:
+                        object.__setattr__(instance, field, row[field])
             instance_list.append(instance)
         await self._execute_prefetch_queries(instance_list)
         return instance_list
+
+    def _has_pk(self, values: dict[str, Any], model: type[Model] | None = None) -> bool:
+        model = model or self.model
+        pk_attr = model._meta.pk_attr
+        if pk_attr in values:
+            return values[pk_attr] is not None
+        pk_column = model._meta.fields_db_projection.get(pk_attr, pk_attr)
+        return pk_column in values and values[pk_column] is not None
 
     async def execute_union(
         self, sql: str, app_field: str, model_field: str, models: set[type[Model]]
     ) -> list:
         _, raw_results = await self.db.execute_query(sql)
         instance_list = []
+        identity_scope = get_current_identity_scope()
 
         for row_idx, row in enumerate(raw_results):
             if row_idx != 0 and row_idx % CHUNK_SIZE == 0:
@@ -184,7 +221,10 @@ class BaseExecutor:
                         for field in row.keys()
                         if field not in [model_field, app_field]
                     }
-                    instance_list.append(model._init_from_db(**row))
+                    if identity_scope is not None and self._has_pk(row, model):
+                        instance_list.append(identity_scope.merge(self.db, model, row))
+                    else:
+                        instance_list.append(model._init_from_db(**row))
                     break
 
         return instance_list
@@ -587,11 +627,7 @@ class BaseExecutor:
 
         for instance in instance_list:
             obj = related_object_map.get(getattr(instance, related_field_name), None)
-            setattr(
-                instance,
-                f"_{field}",
-                obj,
-            )
+            load_related(self.db, instance, field, obj)
             if to_attr:
                 setattr(instance, to_attr, obj)
         return instance_list
@@ -660,13 +696,21 @@ class BaseExecutor:
         relations: list[tuple[Any, Any]] = []
         related_object_list: list[Model] = []
         model_pk, related_pk = self.model._meta.pk, field_object.related_model._meta.pk
+        identity_scope = get_current_identity_scope()
         for e in raw_results:
+            related_values = {
+                key: value for key, value in dict(e).items() if key != "_backward_relation_key"
+            }
             pk_values: tuple[Any, Any] = (
                 model_pk.to_python_value(e["_backward_relation_key"]),
-                related_pk.to_python_value(e[related_pk_field]),
+                related_pk.to_python_value(related_values[related_pk_field]),
             )
             relations.append(pk_values)
-            related_object_list.append(related_query.model._init_from_db(**e))
+            if identity_scope is not None:
+                related = identity_scope.merge(self.db, related_query.model, related_values)
+            else:
+                related = related_query.model._init_from_db(**related_values)
+            related_object_list.append(related)
         await self.__class__(
             model=related_query.model, db=self.db, prefetch_map=related_query._prefetch_map
         )._execute_prefetch_queries(related_object_list)
@@ -705,7 +749,7 @@ class BaseExecutor:
                 if value not in (values := related_objects_for_fetch[key]):
                     values.append(value)
             else:
-                setattr(instance, field, None)
+                load_related(self.db, instance, field, None)
 
         if related_objects_for_fetch:
             conditions: dict[str, Any] = {}
@@ -724,7 +768,7 @@ class BaseExecutor:
                 related_object_map = {getattr(obj, key): obj for obj in related_object_list}
             for instance in instance_list:
                 obj = related_object_map.get(getattr(instance, relation_key_field))
-                setattr(instance, field, obj)
+                load_related(self.db, instance, field, obj)
                 if to_attr:
                     setattr(instance, to_attr, obj)
         return instance_list
