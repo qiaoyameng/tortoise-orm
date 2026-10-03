@@ -124,3 +124,11 @@ class UnSupportedError(BaseORMException):
     """
     The UnSupportedError is raised when operation is not supported.
     """
+
+
+class GraphCycleError(OperationalError):
+    """
+    The GraphCycleError is raised when a graph of objects passed to
+    ``save_graph`` contains a relation cycle that can not be broken by
+    nullable foreign keys.
+    """

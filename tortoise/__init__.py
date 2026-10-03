@@ -23,6 +23,7 @@ from tortoise.fields.relational import (
     ManyToManyFieldInstance,
     OneToOneFieldInstance,
 )
+from tortoise.graph import save_graph
 from tortoise.log import logger
 from tortoise.models import Model, ModelMeta
 from tortoise.timezone import _reset_timezone_cache
@@ -583,4 +584,5 @@ __all__ = [
     "TortoiseConfig",
     "__version__",
     "connections",
+    "save_graph",
 ]

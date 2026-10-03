@@ -13,6 +13,7 @@ Changelog
 
 Added
 ^^^^^
+- ``tortoise.save_graph()`` saves a graph of related new objects in a single transaction: it takes an explicit whitelist of instances plus ``(source, field_name, target)`` relation edges, inserts shared objects once, orders acyclic parts by FK dependency, backfills nullable cycles, reports unbreakable non-nullable cycles with a path diagnostic before any write, and restores assigned primary keys and saved state on rollback.
 - ``Q.__bool__()`` so ``Q`` objects with no filters/children (including nested empty ``Q`` children) are falsy. (#2227)
 - PostgreSQL ``password`` credential now accepts a sync or async callable, resolved once per new connection, to support short-lived credentials such as AWS RDS/Aurora IAM tokens and Azure Entra ID tokens. (#2261)
 
