@@ -26,7 +26,7 @@ from tortoise.exceptions import (
     ValidationError,
 )
 from tortoise.expressions import Expression
-from tortoise.fields.base import Field
+from tortoise.fields.base import DatabaseDefault, Field
 from tortoise.fields.data import IntField
 from tortoise.fields.relational import (
     BackwardFKRelation,
@@ -63,6 +63,17 @@ if TYPE_CHECKING:
 MODEL = TypeVar("MODEL", bound="Model")
 PRIMARY_KEY = TypeVar("PRIMARY_KEY")
 EMPTY = object()
+# Baseline marker for fields whose persisted value is unknown to the instance
+# (e.g. after saving an expression assignment such as ``F("intnum") + 1``).
+_UNKNOWN = object()
+
+
+def _baseline_snapshot(value: Any) -> Any:
+    # Mutable values (e.g. JSONField dicts/lists) are deep-copied so that
+    # later in-place mutation is detected as a change against the baseline.
+    if isinstance(value, (dict, list)):
+        return deepcopy(value)
+    return value
 
 
 def get_together(meta: Model.Meta, together: str) -> tuple[tuple[str, ...], ...]:
@@ -746,6 +757,7 @@ class Model(metaclass=ModelMeta):
         self._saved_in_db = False
         self._custom_generated_pk = False
         self._await_when_save: dict[str, Callable[[], Awaitable[Any]]] = {}
+        self._db_baseline: dict[str, Any] = {}
 
         # Assign defaults for missing fields
         for key in meta.fields.difference(self._set_kwargs(kwargs)):
@@ -824,6 +836,7 @@ class Model(metaclass=ModelMeta):
         self._saved_in_db = True
         self._custom_generated_pk = self._meta.db_pk_column not in self._meta.generated_db_fields
         self._await_when_save = {}
+        self._db_baseline = {}
 
         meta = self._meta
         _setattr = object.__setattr__  # bypass __setattr__ override for performance
@@ -843,9 +856,17 @@ class Model(metaclass=ModelMeta):
             # These fields need manual .to_python_value()
             for key, model_field, field in meta.db_complex_fields:
                 _setattr(self, model_field, field.to_python_value(kwargs[key]))
+            # Record the clean baseline of all loaded fields for dirty tracking.
+            for _key, model_field, _field in (
+                *meta.db_native_fields,
+                *meta.db_default_fields,
+                *meta.db_complex_fields,
+            ):
+                self._db_baseline[model_field] = _baseline_snapshot(getattr(self, model_field))
         except KeyError:
             # Partial model (.only() query) — slower but correct fallback
             self._partial = True
+            self._db_baseline = {}
             native_keys = {k for k, _, _ in meta.db_native_fields}
             default_keys = {k for k, _, _ in meta.db_default_fields}
             for key, value in kwargs.items():
@@ -860,6 +881,7 @@ class Model(metaclass=ModelMeta):
                         value = field.to_python_value(value)
                 model_field = meta.fields_db_projection_reverse.get(key, key)
                 _setattr(self, model_field, value)
+                self._db_baseline[model_field] = _baseline_snapshot(value)
 
         return self
 
@@ -944,6 +966,7 @@ class Model(metaclass=ModelMeta):
         else:
             obj.pk = pk
         obj._saved_in_db = False
+        obj._db_baseline = {}
         return obj
 
     @classmethod
@@ -995,6 +1018,7 @@ class Model(metaclass=ModelMeta):
         _setattr(self, "_saved_in_db", _saved_in_db)
         _setattr(self, "_custom_generated_pk", False)
         _setattr(self, "_await_when_save", {})
+        _setattr(self, "_db_baseline", {})
 
         # Track source fields that are auto-populated from FK/O2O objects
         # so that the default-setting loop doesn't overwrite them with None.
@@ -1128,6 +1152,128 @@ class Model(metaclass=ModelMeta):
     ) -> None:
         await self._wait_for_listeners(Signals.post_save, created, using_db, update_fields)
 
+    def _update_baseline(self, fields: Iterable[str] | None = None) -> None:
+        """
+        Record the current field values as the clean baseline for dirty tracking.
+
+        Must only be called after the values have actually been persisted,
+        so that a failed or cancelled write never marks unwritten data as clean.
+
+        :param fields: The fields to snapshot. Defaults to all db fields.
+        """
+        if fields is None:
+            fields = self._meta.fields_db_projection.keys()
+        baseline = self._db_baseline
+        for field in fields:
+            value = getattr(self, field, EMPTY)
+            if value is EMPTY:
+                baseline.pop(field, None)
+            elif isinstance(value, Expression):
+                # The resulting DB value of an expression is unknown without
+                # re-fetching, so conservatively mark the baseline as unknown.
+                baseline[field] = _UNKNOWN
+            else:
+                baseline[field] = _baseline_snapshot(value)
+
+    def _get_dirty_fields(self) -> set[str]:
+        """
+        Compute the set of db-backed field names whose current value differs
+        from the clean baseline recorded when the instance was loaded or last
+        successfully saved.
+
+        Rules:
+
+        - Fields that were never loaded (e.g. excluded by ``.only()``) are not
+          in the baseline and are never considered dirty.
+        - A value assigned back to its original (baseline) value compares equal
+          and is therefore clean again.
+        - Mutable values (JSON dicts/lists) are compared against a deep-copy
+          snapshot, so in-place mutation is detected.
+        - Fields holding a ``DatabaseDefault`` sentinel are never dirty; the
+          database owns their value.
+        - Fields assigned an ``Expression`` (e.g. ``F``) are always dirty, and
+          stay dirty after saving until ``refresh_from_db()`` re-establishes
+          a known baseline.
+        - Primary key and generated fields are never part of the dirty set.
+        """
+        meta = self._meta
+        baseline = self._db_baseline
+        dirty: set[str] = set()
+        for field in meta.fields_db_projection:
+            if field not in baseline:
+                continue
+            field_obj = meta.fields_map[field]
+            if field_obj.pk or field_obj.generated:
+                continue
+            current = getattr(self, field, EMPTY)
+            if current is EMPTY or isinstance(current, DatabaseDefault):
+                continue
+            if isinstance(current, Expression):
+                dirty.add(field)
+                continue
+            base = baseline[field]
+            if base is _UNKNOWN or current != base:
+                dirty.add(field)
+        if dirty:
+            # auto_now fields are refreshed by every real UPDATE, mirroring
+            # what a full save() would persist.
+            for field in meta.fields_db_projection:
+                if field in baseline and getattr(meta.fields_map[field], "auto_now", False):
+                    dirty.add(field)
+        return dirty
+
+    async def save_dirty(
+        self,
+        using_db: BaseDBAsyncClient | None = None,
+    ) -> list[str] | None:
+        """
+        Save only the fields that changed since the instance was loaded from
+        the database or last successfully saved.
+
+        Unlike :meth:`save`, which updates every db-backed column, this issues
+        an ``UPDATE`` limited to the dirty columns. If nothing changed, no
+        ``UPDATE`` is emitted at all. If the instance was never persisted, a
+        regular insert is performed instead (equivalent to :meth:`save`).
+
+        Dirty-field semantics:
+
+        - Each instance keeps a baseline of the field values as loaded from
+          the database (or as of the last successful save). A field is dirty
+          when its current value compares unequal to that baseline; assigning
+          the original value back therefore makes the field clean again.
+        - Fields that were never loaded (e.g. excluded by ``.only()``) have no
+          baseline and are never considered dirty, so partial instances only
+          ever update the columns that were actually fetched.
+        - Mutable values (JSON dicts/lists) are snapshotted by deep copy, so
+          in-place mutation of a ``JSONField`` value is detected as a change.
+        - Fields holding a ``DatabaseDefault`` sentinel are never dirty; the
+          database owns their value until a concrete value is assigned.
+        - ``auto_now`` fields join the update whenever any other field is
+          dirty, mirroring what a full :meth:`save` would persist, but they
+          never trigger an update on their own.
+        - Assigning an expression (e.g. ``F``) always marks the field dirty.
+          Since the resulting database value is unknown after writing, the
+          field stays dirty until :meth:`refresh_from_db` re-establishes a
+          known baseline.
+
+        The clean baseline is only advanced after the write succeeds, so an
+        exception or cancellation never marks unwritten data as clean.
+
+        :param using_db: Specific DB connection to use instead of default bound
+        :return: ``None`` if a new row was inserted, otherwise the list of
+            field names included in the ``UPDATE`` (empty when no update was
+            necessary).
+        """
+        if not self._saved_in_db:
+            # Never persisted: fall back to a regular save (insert).
+            await self.save(using_db=using_db)
+            return None
+        dirty = sorted(self._get_dirty_fields())
+        if not dirty:
+            return []
+        await self.save(using_db=using_db, update_fields=dirty)
+        return dirty
+
     async def save(
         self,
         using_db: BaseDBAsyncClient | None = None,
@@ -1153,6 +1299,8 @@ class Model(metaclass=ModelMeta):
         await self._set_async_default_field()
         db = using_db or self._choose_db(True)
         executor = db.executor_class(model=self.__class__, db=db)
+        if update_fields is not None:
+            update_fields = list(update_fields)
         if self._partial:
             if update_fields:
                 for field in update_fields:
@@ -1192,6 +1340,9 @@ class Model(metaclass=ModelMeta):
                 created = True
 
         self._saved_in_db = True
+        # The write succeeded: advance the clean baseline so that only later
+        # changes are considered dirty. Never reached on failure/cancellation.
+        self._update_baseline(None if created else update_fields)
         await self._post_save(db, created, update_fields)
 
     async def delete(self, using_db: BaseDBAsyncClient | None = None) -> None:
@@ -1251,6 +1402,8 @@ class Model(metaclass=ModelMeta):
 
         for field in fields or self._meta.db_fields:
             setattr(self, field, getattr(obj, field, None))
+        # Values just read from the DB are clean by definition.
+        self._update_baseline(fields)
 
     @classmethod
     def _choose_db(cls, for_write: bool = False) -> BaseDBAsyncClient:

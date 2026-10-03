@@ -2118,6 +2118,10 @@ class BulkUpdateQuery(UpdateQuery, Generic[MODEL]):
         count = 0
         for sql, values in queries_with_params:
             count += (await self._db.execute_query(sql, values))[0]
+        # The write succeeded: advance the dirty-tracking baseline of each
+        # updated instance for the fields that were just persisted.
+        for obj in self._objects:
+            obj._update_baseline(self.fields)
         return count
 
     def __await__(self) -> Generator[Any, Any, int]:

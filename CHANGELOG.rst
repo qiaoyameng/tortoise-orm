@@ -13,6 +13,7 @@ Changelog
 
 Added
 ^^^^^
+- Add instance dirty-field tracking and ``Model.save_dirty()``. Each model instance now keeps a baseline of the field values as loaded from the database (or last successfully saved), and ``save_dirty()`` issues an ``UPDATE`` limited to the columns whose values differ from that baseline, emitting no ``UPDATE`` at all when nothing changed. Unloaded fields (e.g. from ``.only()``) are never considered dirty, assigning the original value back makes a field clean again, in-place mutation of JSON values is detected via deep-copied snapshots, ``auto_now`` fields join the update whenever any other field changed, expression assignments (e.g. ``F``) stay dirty until ``refresh_from_db()``, and the baseline is only advanced after a write succeeds so failed or cancelled saves never mark unwritten data as clean. The default ``save()`` behavior is unchanged.
 - ``Q.__bool__()`` so ``Q`` objects with no filters/children (including nested empty ``Q`` children) are falsy. (#2227)
 - PostgreSQL ``password`` credential now accepts a sync or async callable, resolved once per new connection, to support short-lived credentials such as AWS RDS/Aurora IAM tokens and Azure Entra ID tokens. (#2261)
 

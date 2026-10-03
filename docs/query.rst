@@ -32,8 +32,33 @@ The following methods can be used to create an object:
 The instance of a model has the following methods:
 
 - ``save()`` - update instance, or insert it, if it was never saved before
+- ``save_dirty()`` - update only the fields that changed since the instance was loaded or last saved
 - ``delete()`` - delete instance from db
 - ``fetch_related(*args)`` - fetches objects related to instance. It can fetch FK relation, Backward-FK relations and M2M relations. It also can fetch variable depth of related objects like this: ``await team.fetch_related('events__tournament')`` - this will fetch all events for team, and for each of this events their tournament will be prefetched too. After fetching objects they should be available normally like this: ``team.events[0].tournament.name``
+
+``save()`` always updates every db-backed column of the instance. When you
+fetch a model, change a single attribute and want to persist just that
+change, ``save_dirty()`` emits an ``UPDATE`` limited to the changed columns,
+and emits no ``UPDATE`` at all when nothing changed:
+
+.. code-block:: python3
+
+    tournament = await Tournament.get(pk=1)
+    tournament.name = "New name"
+    await tournament.save_dirty()  # UPDATE ... SET "name" = ... only
+
+Each instance remembers the field values as loaded from the database (its
+baseline). A field counts as changed when its current value compares unequal
+to that baseline, so assigning the original value back makes it clean again.
+Fields that were never loaded (e.g. excluded by ``.only()``) are never
+considered changed. Mutable values such as ``JSONField`` dicts/lists are
+snapshotted by deep copy, so in-place mutation is detected as well.
+``auto_now`` fields join the update whenever any other field changed, but
+never trigger an update on their own. Assigning an expression (e.g. ``F``)
+always marks the field changed, and it stays changed until
+``refresh_from_db()`` re-reads the resulting value. The baseline is only
+advanced after a write succeeds, so a failed or cancelled save never marks
+unwritten data as clean.
 
 Another approach to work with related objects on instance is to query them explicitly with ``async for``:
 
